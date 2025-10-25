@@ -107,7 +107,7 @@ def predictions(
     params: dict = {"rid": run_id, "lim": limit, "off": offset}
 
     if dialect == "postgresql":
-        ds_expr = "to_char(ds AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS ds"
+        ds_expr = """to_char(ds AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS ds"""
         if start_dt is not None: where.append("ds >= CAST(:start AS timestamptz)"); params["start"] = start_dt
         if end_dt   is not None: where.append("ds <  CAST(:end   AS timestamptz)"); params["end"]   = end_dt
     else:
