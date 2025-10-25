@@ -27,19 +27,4 @@ class TrainingSession:
         t0 = time.time()
         self.model.fit(df)
         preds = self.model.predict(horizon)
-        _save_predictions_parquet(preds)
         return RunResult(run_id=run_id, duration_sec=time.time()-t0, predictions=preds)
-
-
-def _save_predictions_parquet(df, path='outputs/predictions.parquet'):
-    try:
-        import pandas as _pd, pathlib as _pl
-        _pl.Path('outputs').mkdir(parents=True, exist_ok=True)
-        # pandas/pyarrowが無くても to_csv にフォールバック
-        if hasattr(df, 'to_parquet'):
-            df.to_parquet(path)
-        else:
-            df.to_csv(path, index=False)
-        print(f"[pipeline] predictions saved -> {path}")
-    except Exception as _e:
-        print(f"[pipeline] predictions save skipped: {_e}")
