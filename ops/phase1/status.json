@@ -2,15 +2,16 @@
   "goals": ["Dry-runで主要経路の時間・件数・ログ採取", "構造/依存の把握（JSON/DOT）", "ローカルPostgresでのE2E整備"],
   "acceptance_criteria": ["cli runがPostgresで完走", "outputs/last_run.json が保存", "metrics-*.json が生成"],
   "plan": ["DB初期化/検証", "JSON成果物/抽出器の堅牢化", "MLflow連携の有効化", "状態/進捗の可視化"],
-  "actions": ["setup_db.py --init(postgresql:///tsmodeling)", "cli.pyに--with-mlflow追加とJSON保存", "extract_metricsの堅牢化"],
+  "actions": ["setup_db.py --init(postgresql:///tsmodeling)", "cli.py: with_mlflow & JSON保存", "extract_metrics: JSON優先+バランス抽出"],
   "findings": {
-    "metrics_file": "",
+    "metrics_file": "ops/phase1/metrics-1761434232384137265.json",
     "artifacts": [
       "outputs/last_run.json",
       "ops/phase1/metrics-*.json",
       "ops/phase1/run-*.log",
       "ops/phase1/imports.dot(,svg)",
-      "plan/progress.md"
+      "plan/progress.md",
+      "mlruns/"
     ]
   },
   "risks": ["本番スキーマ差異", "MLflow URI の切替忘れ"],
