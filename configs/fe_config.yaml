@@ -1,0 +1,13 @@
+config_name: "features_v1"
+base_data:
+  dataset: "demo"
+  start_date: "2024-01-01"
+  end_date: "2024-06-30"
+features:
+  - type: "lag"
+    params:
+      column: "y"
+      lags: [1, 7]
+  - type: "day_of_week"
+    params:
+      column: "ds"

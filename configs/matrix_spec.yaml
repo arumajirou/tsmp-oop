@@ -1,0 +1,10 @@
+matrix:
+  model_name: ["BaselineMean"]
+  horizon: [7, 14]
+  hyperparams:
+    window: [7, 14, 28]
+dataset_path: "data/processed/features_demo.parquet"
+val_size: 0.2
+max_parallel_runs: 2
+tuner_backend: "none"
+log_level: "INFO"

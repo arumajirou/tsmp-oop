@@ -1,0 +1,6 @@
+models:
+  BaselineMean:
+    allowed_params: [window]
+    constraints:
+      window:
+        allowed: [3, 5, 7, 14, 28]

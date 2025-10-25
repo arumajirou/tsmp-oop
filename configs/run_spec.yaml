@@ -1,0 +1,10 @@
+alias: "demo_lstm_oop"
+model_name: "BaselineMean"
+dataset_path: "data/processed/features_demo.parquet"
+horizon: 7
+val_size: 0.2
+hyperparams:
+  window: 7
+tuner_backend: "none"
+log_level: "INFO"
+instance_type: "local"

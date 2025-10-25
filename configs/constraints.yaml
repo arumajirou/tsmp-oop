@@ -1,0 +1,14 @@
+# Non-local constraints across pipeline (example)
+rules:
+  - name: "short_horizon_requires_small_window"
+    when:
+      horizon_max: 7
+    then:
+      cap_params:
+        window_max: 14
+
+  - name: "memory_guardrail"
+    when:
+      estimated_features: "high"
+    then:
+      reduce_features_by: 0.5
