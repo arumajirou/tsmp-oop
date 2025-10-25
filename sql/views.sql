@@ -2,7 +2,7 @@ CREATE OR REPLACE VIEW run_summary AS
 SELECT
   run_id, alias, model_name, dataset, status,
   duration_sec, created_at, updated_at,
-  json_extract_path_text(config::json, 'config', 'horizon') as horizon
+  (config #>> '{config,horizon}')::int AS horizon
 FROM runs
 ORDER BY created_at DESC;
 

@@ -1,0 +1,4 @@
+[pipeline] predictions saved -> outputs/predictions.parquet
+[persist] runs upserted: run_id=7bb11a10a8ab
+[persist] predictions upserted from outputs/predictions.parquet
+{"run_id": "7bb11a10a8ab", "duration_sec": 0.0017130374908447266, "dq": {"n_rows": 120, "missing_rate": 0.0}, "predictions_rows": 14, "context": {"cpu_percent": 0.0, "memory_mb": 124.0703125}}

@@ -1,3 +1,4 @@
+# .github/workflows/pytest.yml
 name: pytest (sqlite)
 on: [push, pull_request]
 jobs:
@@ -6,9 +7,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
-      - run: pip install -U pip && pip install -e .[dev] pytest sqlalchemy pyyaml pandas pyarrow mlflow
-      - name: Initialize DB (sqlite) and run tests
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install deps
         run: |
-          python -V
-          pytest -q
+          python -m pip install -U pip
+          pip install -r requirements.txt
+          pip install pyarrow  # parquet 読み出し用
+      - name: Run tests
+        env:
+          POSTGRES_DSN: ""   # CI は sqlite フォールバック
+          MLFLOW_TRACKING_URI: "file:./mlruns"
+        run: pytest -q

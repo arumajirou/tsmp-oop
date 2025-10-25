@@ -1,6 +1,6 @@
 {
-  "run_id": "ec84bf5e3f64",
-  "duration_sec": 0.0008497238159179688,
+  "run_id": "fa84e95f0b95",
+  "duration_sec": 0.0015516281127929688,
   "dq": {
     "n_rows": 120,
     "missing_rate": 0.0
@@ -8,6 +8,6 @@
   "predictions_rows": 14,
   "context": {
     "cpu_percent": 0.0,
-    "memory_mb": 124.671875
+    "memory_mb": 124.9296875
   }
 }
