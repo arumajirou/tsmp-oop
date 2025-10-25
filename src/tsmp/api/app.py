@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
 import os
 from sqlalchemy import create_engine, text
+from fastapi.responses import JSONResponse
 
 app = FastAPI(title="tsmp-oop")
 
@@ -123,7 +124,7 @@ def health():
 
     overall = bool(ok_p95 and ok_ratio)
     status_code = status.HTTP_200_OK if overall else status.HTTP_503_SERVICE_UNAVAILABLE
-    return {
+    payload = {
         "ok": overall,
         "checks": {
             "duration_p95_sec": p95,
@@ -132,7 +133,8 @@ def health():
             "ratio_threshold": KPI_PREDICTIONS_RATIO,
             "latest_run_id": latest_run
         }
-    }, status_code
+    }
+    return JSONResponse(content=payload, status_code=status_code)
 
 
 from fastapi import status
@@ -172,7 +174,7 @@ def health():
 
     overall = bool(ok_p95 and ok_ratio)
     status_code = status.HTTP_200_OK if overall else status.HTTP_503_SERVICE_UNAVAILABLE
-    return {
+    payload = {
         "ok": overall,
         "checks": {
             "duration_p95_sec": p95,
@@ -181,7 +183,8 @@ def health():
             "ratio_threshold": KPI_PREDICTIONS_RATIO,
             "latest_run_id": latest_run
         }
-    }, status_code
+    }
+    return JSONResponse(content=payload, status_code=status_code)
 
 
 @app.get("/runs")
