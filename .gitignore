@@ -11,3 +11,7 @@ outputs/*
 mlruns/
 htmlcov/
 .pytest_cache/
+
+# outputs: generally ignore, but keep the canonical artifact
+outputs/*
+!outputs/last_run.json
