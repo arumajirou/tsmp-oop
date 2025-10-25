@@ -1,0 +1,9 @@
+{
+  "goals": ["Dry-runで主要経路の時間・件数・ログ採取", "構造/依存の把握", "即時障害の除去"],
+  "acceptance_criteria": ["cli runがエラーなく完走", "構造JSONが生成され保存", "進捗表が作成・コミット済"],
+  "plan": ["不具合修正", "構造解析(JSON)", "Dry-run実行と計測", "進捗表と履歴を残す"],
+  "actions": ["config.py修正", "setup_db.pyに--init追加", "inspect_repo.pyで構造収集", "ops/phase1ログ保存"],
+  "findings": {"metrics": {}, "artifacts": ["ops/phase1/structure-<ts>.json", "ops/phase1/run-<ts>.log", "plan/progress.md"]},
+  "risks": ["Dry-runのサンプルが実データの負荷を代表しない", "MLflow/DBの切替時の権限差異"],
+  "next": ["依存グラフ可視化(dot)の追加", "MLflow連携Dry-run", "DB永続化シナリオのE2E"]
+}
