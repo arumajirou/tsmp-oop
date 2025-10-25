@@ -1,6 +1,6 @@
 {
-  "run_id": "bee0723b7095",
-  "duration_sec": 0.0016162395477294922,
+  "run_id": "97734d292563",
+  "duration_sec": 0.0015959739685058594,
   "dq": {
     "n_rows": 120,
     "missing_rate": 0.0
@@ -8,6 +8,6 @@
   "predictions_rows": 14,
   "context": {
     "cpu_percent": 0.0,
-    "memory_mb": 125.44921875
+    "memory_mb": 124.55078125
   }
 }
