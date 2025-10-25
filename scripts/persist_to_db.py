@@ -39,7 +39,7 @@ def upsert_predictions(engine, df: pd.DataFrame, run_id: str):
         d = row._asdict() if hasattr(row, "_asdict") else dict(row._asdict())
         # 柔軟対応
         uid = d.get("unique_id") or d.get("series") or d.get("id")
-        ds = pd.to_datetime(d.get("ds") or d.get("date") or d.get("timestamp"))
+        ds = pd.to_datetime(d.get("ds") or d.get("date") or d.get("timestamp"), utc=True)
         y = d.get("y_hat") or d.get("yhat") or d.get("forecast") or d.get("value")
         if uid is None or pd.isna(ds) or y is None:
             continue
