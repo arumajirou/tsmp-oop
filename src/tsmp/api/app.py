@@ -89,73 +89,60 @@ def predictions(
     limit: int = 1000,
     offset: int = 0
 ):
-    order_sql = "DESC" if str(order).lower() == "desc" else "ASC"\n    # --- multi-unique_id expansion ---\n    uids = []\n    if unique_id:\n        for u in (unique_id if isinstance(unique_id, list) else [unique_id]):\n            uids.extend([x.strip() for x in str(u).split(',') if x.strip()])\n    uids = list(dict.fromkeys(uids))  # de-dup\n    # 方言別 ds のISO8601Z整形
-    dialect = engine.url.get_backend_name()\n    if dialect == 'postgresql':\n        ds_expr = "to_char(ds AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS ds"\n    else:\n        ds_expr = "strftime('%Y-%m-%dT%H:%M:%SZ', ds) AS ds"\n
-    dialect = engine.url.get_backend_name()
-    # 方言別の式
-    if dialect == 'postgresql':
-        created_expr = "to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at"
-        updated_expr = "to_char(r.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at"
-    else:
-        # sqlite: TEXT型DATETIME想定
-        created_expr = "strftime('%Y-%m-%dT%H:%M:%SZ', r.created_at) AS created_at"
-        updated_expr = "strftime('%Y-%m-%dT%H:%M:%SZ', r.updated_at) AS updated_at"
-    horizon_expr = "COALESCE((r.config #>> '{config,horizon}')::int, NULL) AS horizon" if dialect=='postgresql' else "CAST(json_extract(r.config,'$.config.horizon') AS INT) AS horizon"
-    n_pred_expr = "(SELECT count(*) FROM predictions p WHERE p.run_id=r.run_id) AS n_predictions"
-    _RUNS_WINDOW_COLSQL = {
-        'run_id': 'r.run_id',
-        'alias': 'r.alias',
-        'model_name': 'r.model_name',
-        'dataset': 'r.dataset',
-        'status': 'r.status',
-        'duration_sec': 'r.duration_sec',
-        'created_at': created_expr,
-        'updated_at': updated_expr,
-        'horizon': horizon_expr,
-        'n_predictions': n_pred_expr,
-    }
-    allowed = list(_RUNS_WINDOW_COLSQL.keys())
-    # fields パース（未指定なら全列）。常に run_id は含める。
-    if fields:
-        req = [x.strip() for x in fields.split(',') if x.strip() in allowed]
-        if 'run_id' not in req: req = ['run_id'] + req
-        if not req: req = allowed
-    else:
-        req = allowed
-    select_list = ', '.join(_RUNS_WINDOW_COLSQL[k] + f" AS {k}" if ' AS ' not in _RUNS_WINDOW_COLSQL[k] else _RUNS_WINDOW_COLSQL[k] for k in req)
-    # ↑ horizon/created_at/updated_at/n_predictions は式に AS が含まれるのでそのまま
+    # 正規化: unique_id は配列/カンマの両方を受ける
+    uids: list[str] = []
+    if unique_id:
+        for u in unique_id:
+            uids.extend([x.strip() for x in str(u).split(",") if x.strip()])
+    uids = list(dict.fromkeys(uids))  # de-dup
 
+    order_sql = "DESC" if str(order).lower() == "desc" else "ASC"
+
+    # 方言分岐 + ds/閾値の整形
+    dialect = engine.url.get_backend_name()
     start_dt = _parse_utc_ceil(start)
     end_dt = _parse_utc_ceil(end)
 
-    params: dict = {"rid": run_id, "uid": unique_id, "lim": limit, "off": offset}
-    where = ["run_id = :rid", "(:uid IS NULL OR unique_id = :uid)"]
+    where = ["run_id = :rid"]
+    params: dict = {"rid": run_id, "lim": limit, "off": offset}
 
     if dialect == "postgresql":
-        if start_dt is not None: where.append("ds >= CAST(:pstart AS timestamptz)")
-        if end_dt   is not None: where.append("ds <  CAST(:pend   AS timestamptz)")
-        ts_select = 'to_char(ds AT TIME ZONE \'UTC\',\'YYYY-MM-DD"T"HH24:MI:SS"Z"\') AS ds'
-        pstart, pend = start_dt, end_dt
+        ds_expr = "to_char(ds AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS ds"
+        if start_dt is not None: where.append("ds >= CAST(:start AS timestamptz)"); params["start"] = start_dt
+        if end_dt   is not None: where.append("ds <  CAST(:end   AS timestamptz)"); params["end"]   = end_dt
     else:
+        ds_expr = "strftime('%Y-%m-%dT%H:%M:%SZ', ds) AS ds"
         if start_dt is not None:
-            params["pstart"] = start_dt.strftime("%Y-%m-%d %H:%M:%S"); where.append("ds >= :pstart")
+            params["start"] = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+            where.append("ds >= :start")
         if end_dt is not None:
-            params["pend"] = end_dt.strftime("%Y-%m-%d %H:%M:%S");   where.append("ds <  :pend")
-        ts_select = "replace(ds,' ','T')||'Z' AS ds"
-        pstart, pend = params.get("pstart"), params.get("pend")
+            params["end"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+            where.append("ds < :end")
 
-    where_sql = " AND ".join(where)
+    # IN 句の安全展開
+    uid_clause = ""
+    if uids:
+        ph = []
+        for i, u in enumerate(uids):
+            k = f"u{i}"
+            params[k] = u
+            ph.append(":" + k)
+        uid_clause = f" AND unique_id IN ({','.join(ph)})"
+
     sql = f"""
-      SELECT unique_id, {ts_select}, y_hat
+      SELECT unique_id, {ds_expr}, y_hat
       FROM predictions
-      WHERE {where_sql}
+      WHERE {' AND '.join(where)}{uid_clause}
       ORDER BY ds {order_sql}
       LIMIT :lim OFFSET :off
     """
+    sql_total = f"SELECT count(*) FROM predictions WHERE {' AND '.join(where)}{uid_clause}"
+
     with engine.begin() as conn:
-        base = {**params, "pstart": pstart, "pend": pend}
-        rows = conn.execute(text(sql), base).mappings().all()
-        return {"run_id": run_id, "count": len(rows), "items": [dict(r) for r in rows]}
+        items = [dict(r) for r in conn.execute(text(sql), params).mappings().all()]
+        total = int(conn.execute(text(sql_total), params).scalar_one())
+
+    return {"run_id": run_id, "count": len(items), "total": total, "items": items}
 
 @app.get("/health")
 def health():

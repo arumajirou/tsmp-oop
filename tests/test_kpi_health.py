@@ -34,18 +34,35 @@ def test_kpi_thresholds(tmp_path):
         assert p95 <= 5.0  # 秒
 
         # 最新 run の期待予測数充足率（= 実件数 / (系列数*H)）
-        row = conn.execute(text("""
-          WITH latest AS (
-            SELECT run_id, (config #>> '{config,horizon}') as horizon_txt
-            FROM runs ORDER BY created_at DESC LIMIT 1
-          ),
-          s AS (SELECT count(DISTINCT p.unique_id) AS n_series
-                FROM predictions p JOIN latest l ON p.run_id=l.run_id),
-          c AS (SELECT count(*) AS n_pred
-                FROM predictions p JOIN latest l ON p.run_id=l.run_id)
-          SELECT CAST(l.horizon_txt AS INT) AS h, s.n_series, c.n_pred
-          FROM latest l CROSS JOIN s CROSS JOIN c
-        """)).first()
+        # 方言分岐（sqlite は json_extract、PG は #>>）
+        dialect = conn.engine.url.get_backend_name()
+        if dialect == "postgresql":
+            sql = """
+              WITH latest AS (
+                SELECT run_id, (config #>> '{config,horizon}') as horizon_txt
+                FROM runs ORDER BY created_at DESC LIMIT 1
+              ),
+              s AS (SELECT count(DISTINCT p.unique_id) AS n_series
+                    FROM predictions p JOIN latest l ON p.run_id=l.run_id),
+              c AS (SELECT count(*) AS n_pred
+                    FROM predictions p JOIN latest l ON p.run_id=l.run_id)
+              SELECT CAST(l.horizon_txt AS INT) AS h, s.n_series, c.n_pred
+              FROM latest l CROSS JOIN s CROSS JOIN c
+            """
+        else:
+            sql = """
+              WITH latest AS (
+                SELECT run_id, json_extract(config,'$.config.horizon') as horizon_txt
+                FROM runs ORDER BY created_at DESC LIMIT 1
+              ),
+              s AS (SELECT count(DISTINCT p.unique_id) AS n_series
+                    FROM predictions p JOIN latest l ON p.run_id=l.run_id),
+              c AS (SELECT count(*) AS n_pred
+                    FROM predictions p JOIN latest l ON p.run_id=l.run_id)
+              SELECT CAST(l.horizon_txt AS INT) AS h, s.n_series, c.n_pred
+              FROM latest l CROSS JOIN s CROSS JOIN c
+            """
+        row = conn.execute(text(sql)).first()
         if row:
             h, n_series, n_pred = row
             if h and n_series:
