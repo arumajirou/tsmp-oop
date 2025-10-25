@@ -77,6 +77,7 @@ def latest_run():
 
 
 
+
 @app.get("/predictions")
 def predictions(
     run_id: str = Query(...),
@@ -102,12 +103,11 @@ def predictions(
         pstart, pend = start_dt, end_dt
     else:
         if start_dt is not None:
-            params["pstart"] = start_dt.strftime("%Y-%m-%d %H:%M:%S")
-            where.append("ds >= :pstart")
+            params["pstart"] = start_dt.strftime("%Y-%m-%d %H:%M:%S"); where.append("ds >= :pstart")
         if end_dt is not None:
-            params["pend"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
-            where.append("ds <  :pend")
-        ts_select = "ds AS ds"
+            params["pend"] = end_dt.strftime("%Y-%m-%d %H:%M:%S");   where.append("ds <  :pend")
+        # SQLite でも ISO8601Z を生成
+        ts_select = "replace(ds,' ','T')||'Z' AS ds"
         pstart, pend = params.get("pstart"), params.get("pend")
 
     where_sql = " AND ".join(where)
@@ -255,6 +255,7 @@ def _parse_utc_ceil(s: str|None):
     return dt
 
 
+
 @app.get("/runs/window")
 def runs_window(
     start: str | None = Query(None, description="ISO8601 UTC, e.g. 2025-01-01T00:00:00Z"),
@@ -282,21 +283,20 @@ def runs_window(
         params["alias"] = alias
 
     if dialect == "postgresql":
-        # PG: 生の datetime を渡し CAST する
         if start_dt is not None: where.append("r.created_at >= CAST(:start AS timestamptz)")
         if end_dt   is not None: where.append("r.created_at <  CAST(:end   AS timestamptz)")
         ts_cols = """to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
                      to_char(r.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at"""
+        horizon_sql = "COALESCE((r.config #>> '{config,horizon}')::int, NULL) AS horizon"
         start_param, end_param = start_dt, end_dt
     else:
-        # SQLite: 文字列比較
+        # SQLite: 文字列比較 + ISO8601Z を生成（' ' → 'T'、末尾にZ）
         if start_dt is not None:
-            params["start"] = start_dt.strftime("%Y-%m-%d %H:%M:%S")
-            where.append("r.created_at >= :start")
+            params["start"] = start_dt.strftime("%Y-%m-%d %H:%M:%S"); where.append("r.created_at >= :start")
         if end_dt is not None:
-            params["end"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
-            where.append("r.created_at <  :end")
-        ts_cols = "r.created_at AS created_at, r.updated_at AS updated_at"
+            params["end"] = end_dt.strftime("%Y-%m-%d %H:%M:%S");   where.append("r.created_at <  :end")
+        ts_cols = "replace(r.created_at,' ','T')||'Z' AS created_at, replace(r.updated_at,' ','T')||'Z' AS updated_at"
+        horizon_sql = "NULL AS horizon"
         start_param, end_param = params.get("start"), params.get("end")
 
     where_sql = " AND ".join(where)
@@ -304,16 +304,14 @@ def runs_window(
     sql = f"""
       SELECT r.run_id, r.alias, r.model_name, r.dataset, r.status, r.duration_sec,
              {ts_cols},
-             COALESCE((r.config #>> '{{config,horizon}}')::int, NULL) AS horizon,
+             {horizon_sql},
              (SELECT count(*) FROM predictions p WHERE p.run_id = r.run_id) AS n_predictions
       FROM runs r
       WHERE {where_sql}
       ORDER BY r.created_at DESC
       LIMIT :lim OFFSET :off
     """
-
     with engine.begin() as conn:
-        # どちらの方言でも start/end を常に渡す（未使用なら無視される）
         base = {**params, "start": start_param, "end": end_param}
         total = int(conn.execute(text(sql_total), base).scalar_one())
         items = [dict(row) for row in conn.execute(text(sql), base).mappings().all()]
