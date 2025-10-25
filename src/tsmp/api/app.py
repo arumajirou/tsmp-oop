@@ -48,3 +48,100 @@ def predictions(run_id: str = Query(...), limit: int = 1000, offset: int = 0):
     with engine.begin() as conn:
         rows = conn.execute(text(sql), {"rid": run_id, "lim": limit, "off": offset}).mappings().all()
         return {"run_id": run_id, "count": len(rows), "items": [dict(r) for r in rows]}
+
+from fastapi import status
+import math
+
+KPI_DURATION_P95_MS = int(os.getenv("KPI_DURATION_P95_MS", "5000"))
+KPI_PREDICTIONS_RATIO = float(os.getenv("KPI_PREDICTIONS_RATIO", "1.0"))
+
+@app.get("/health")
+def health():
+    # 1) duration p95
+    sql_p95 = "SELECT COALESCE(percentile_disc(0.95) WITHIN GROUP (ORDER BY duration_sec), 0) AS p95 FROM runs"
+    # 2) 最新 run の予測充足率（= 実際件数 / (ユニーク系列数 * horizon)）
+    sql_ratio = """
+      WITH latest AS (
+        SELECT run_id, (config #>> '{config,horizon}')::int AS horizon
+        FROM runs ORDER BY created_at DESC LIMIT 1
+      ),
+      s AS (SELECT count(DISTINCT p.unique_id) AS n_series
+            FROM predictions p JOIN latest l ON p.run_id = l.run_id),
+      c AS (SELECT count(*) AS n_pred
+            FROM predictions p JOIN latest l ON p.run_id = l.run_id)
+      SELECT l.run_id, l.horizon, s.n_series, c.n_pred,
+             CASE WHEN s.n_series>0 AND l.horizon>0
+                  THEN c.n_pred::float / (s.n_series * l.horizon)
+                  ELSE NULL END AS ratio
+      FROM latest l CROSS JOIN s CROSS JOIN c
+    """
+    with engine.begin() as conn:
+        p95 = float(conn.execute(text(sql_p95)).scalar_one())
+        r = conn.execute(text(sql_ratio)).mappings().first()
+        ratio = (float(r["ratio"]) if r and r["ratio"] is not None else None)
+        latest_run = (r["run_id"] if r else None)
+
+    ok_p95 = (p95 * 1000.0) <= KPI_DURATION_P95_MS  # sec→ms
+    ok_ratio = (ratio is None) or (ratio >= KPI_PREDICTIONS_RATIO)
+
+    overall = bool(ok_p95 and ok_ratio)
+    status_code = status.HTTP_200_OK if overall else status.HTTP_503_SERVICE_UNAVAILABLE
+    return {
+        "ok": overall,
+        "checks": {
+            "duration_p95_sec": p95,
+            "threshold_ms": KPI_DURATION_P95_MS,
+            "predictions_ratio": ratio,
+            "ratio_threshold": KPI_PREDICTIONS_RATIO,
+            "latest_run_id": latest_run
+        }
+    }, status_code
+
+
+from fastapi import status
+import math
+
+KPI_DURATION_P95_MS = int(os.getenv("KPI_DURATION_P95_MS", "5000"))
+KPI_PREDICTIONS_RATIO = float(os.getenv("KPI_PREDICTIONS_RATIO", "1.0"))
+
+@app.get("/health")
+def health():
+    # 1) duration p95
+    sql_p95 = "SELECT COALESCE(percentile_disc(0.95) WITHIN GROUP (ORDER BY duration_sec), 0) AS p95 FROM runs"
+    # 2) 最新 run の予測充足率（= 実際件数 / (ユニーク系列数 * horizon)）
+    sql_ratio = """
+      WITH latest AS (
+        SELECT run_id, (config #>> '{config,horizon}')::int AS horizon
+        FROM runs ORDER BY created_at DESC LIMIT 1
+      ),
+      s AS (SELECT count(DISTINCT p.unique_id) AS n_series
+            FROM predictions p JOIN latest l ON p.run_id = l.run_id),
+      c AS (SELECT count(*) AS n_pred
+            FROM predictions p JOIN latest l ON p.run_id = l.run_id)
+      SELECT l.run_id, l.horizon, s.n_series, c.n_pred,
+             CASE WHEN s.n_series>0 AND l.horizon>0
+                  THEN c.n_pred::float / (s.n_series * l.horizon)
+                  ELSE NULL END AS ratio
+      FROM latest l CROSS JOIN s CROSS JOIN c
+    """
+    with engine.begin() as conn:
+        p95 = float(conn.execute(text(sql_p95)).scalar_one())
+        r = conn.execute(text(sql_ratio)).mappings().first()
+        ratio = (float(r["ratio"]) if r and r["ratio"] is not None else None)
+        latest_run = (r["run_id"] if r else None)
+
+    ok_p95 = (p95 * 1000.0) <= KPI_DURATION_P95_MS  # sec→ms
+    ok_ratio = (ratio is None) or (ratio >= KPI_PREDICTIONS_RATIO)
+
+    overall = bool(ok_p95 and ok_ratio)
+    status_code = status.HTTP_200_OK if overall else status.HTTP_503_SERVICE_UNAVAILABLE
+    return {
+        "ok": overall,
+        "checks": {
+            "duration_p95_sec": p95,
+            "threshold_ms": KPI_DURATION_P95_MS,
+            "predictions_ratio": ratio,
+            "ratio_threshold": KPI_PREDICTIONS_RATIO,
+            "latest_run_id": latest_run
+        }
+    }, status_code
