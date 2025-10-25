@@ -76,6 +76,7 @@ def latest_run():
         return d
 
 
+
 @app.get("/predictions")
 def predictions(
     run_id: str = Query(...),
@@ -88,22 +89,18 @@ def predictions(
 ):
     order_sql = "DESC" if str(order).lower() == "desc" else "ASC"
     dialect = engine.url.get_backend_name()
-    # 再利用: _parse_utc_ceil は既に定義済み
     start_dt = _parse_utc_ceil(start)
     end_dt = _parse_utc_ceil(end)
 
-    params = {"rid": run_id, "uid": unique_id, "lim": limit, "off": offset,
-              "pstart": start_dt, "pend": end_dt}
-
+    params: dict = {"rid": run_id, "uid": unique_id, "lim": limit, "off": offset}
     where = ["run_id = :rid", "(:uid IS NULL OR unique_id = :uid)"]
+
     if dialect == "postgresql":
-        if start_dt is not None:
-            where.append("ds >= CAST(:pstart AS timestamptz)")
-        if end_dt is not None:
-            where.append("ds <  CAST(:pend   AS timestamptz)")
-        ts_select = "to_char(ds AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS ds"
+        if start_dt is not None: where.append("ds >= CAST(:pstart AS timestamptz)")
+        if end_dt   is not None: where.append("ds <  CAST(:pend   AS timestamptz)")
+        ts_select = 'to_char(ds AT TIME ZONE \'UTC\',\'YYYY-MM-DD"T"HH24:MI:SS"Z"\') AS ds'
+        pstart, pend = start_dt, end_dt
     else:
-        # sqlite: ds は "YYYY-MM-DD HH:MM:SS" 想定（init_schema.sqlに準拠）
         if start_dt is not None:
             params["pstart"] = start_dt.strftime("%Y-%m-%d %H:%M:%S")
             where.append("ds >= :pstart")
@@ -111,6 +108,7 @@ def predictions(
             params["pend"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
             where.append("ds <  :pend")
         ts_select = "ds AS ds"
+        pstart, pend = params.get("pstart"), params.get("pend")
 
     where_sql = " AND ".join(where)
     sql = f"""
@@ -121,7 +119,8 @@ def predictions(
       LIMIT :lim OFFSET :off
     """
     with engine.begin() as conn:
-        rows = conn.execute(text(sql), params).mappings().all()
+        base = {**params, "pstart": pstart, "pend": pend}
+        rows = conn.execute(text(sql), base).mappings().all()
         return {"run_id": run_id, "count": len(rows), "items": [dict(r) for r in rows]}
 
 @app.get("/health")
@@ -255,6 +254,7 @@ def _parse_utc_ceil(s: str|None):
         dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt
 
+
 @app.get("/runs/window")
 def runs_window(
     start: str | None = Query(None, description="ISO8601 UTC, e.g. 2025-01-01T00:00:00Z"),
@@ -264,18 +264,13 @@ def runs_window(
     alias: str | None = Query(None),
     limit: int = 50,
     offset: int = 0
-),
-    end: str | None = Query(None, description="ISO8601 UTC (exclusive)"),
-    status: str | None = Query(None),
-    limit: int = 50,
-    offset: int = 0
 ):
     dialect = engine.url.get_backend_name()
     start_dt = _parse_utc_ceil(start)
     end_dt = _parse_utc_ceil(end)
 
-    params = {"lim": limit, "off": offset}
-    where = []
+    params: dict = {"lim": limit, "off": offset}
+    where = ["1=1"]
     if status:
         where.append("r.status = :status")
         params["status"] = status
@@ -287,32 +282,39 @@ def runs_window(
         params["alias"] = alias
 
     if dialect == "postgresql":
-        if start_dt: params["start"] = start_dt; where.append("r.created_at >= CAST(:start AS timestamptz)")
-        if end_dt:   params["end"]   = end_dt;   where.append("r.created_at <  CAST(:end   AS timestamptz)")
-        ts_cols = "to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, to_char(r.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at"
-        horizon_sql = "COALESCE((r.config #>> '{config,horizon}')::int, NULL) AS horizon,"
+        # PG: 生の datetime を渡し CAST する
+        if start_dt is not None: where.append("r.created_at >= CAST(:start AS timestamptz)")
+        if end_dt   is not None: where.append("r.created_at <  CAST(:end   AS timestamptz)")
+        ts_cols = """to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+                     to_char(r.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at"""
+        start_param, end_param = start_dt, end_dt
     else:
-        # sqlite: TEXT比較。UTC整形はそのまま返す
-        if start_dt: params["start"] = start_dt.strftime("%Y-%m-%d %H:%M:%S"); where.append("r.created_at >= :start")
-        if end_dt:   params["end"]   = end_dt.strftime("%Y-%m-%d %H:%M:%S");   where.append("r.created_at <  :end")
+        # SQLite: 文字列比較
+        if start_dt is not None:
+            params["start"] = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+            where.append("r.created_at >= :start")
+        if end_dt is not None:
+            params["end"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+            where.append("r.created_at <  :end")
         ts_cols = "r.created_at AS created_at, r.updated_at AS updated_at"
-        horizon_sql = "NULL AS horizon,"
+        start_param, end_param = params.get("start"), params.get("end")
 
-    where_sql = " AND ".join(where) if where else "1=1"
-
+    where_sql = " AND ".join(where)
+    sql_total = f"SELECT count(*) FROM runs r WHERE {where_sql}"
     sql = f"""
       SELECT r.run_id, r.alias, r.model_name, r.dataset, r.status, r.duration_sec,
              {ts_cols},
-             {horizon_sql}
-             (SELECT count(*) FROM predictions p WHERE p.run_id=r.run_id) AS n_predictions
+             COALESCE((r.config #>> '{{config,horizon}}')::int, NULL) AS horizon,
+             (SELECT count(*) FROM predictions p WHERE p.run_id = r.run_id) AS n_predictions
       FROM runs r
       WHERE {where_sql}
       ORDER BY r.created_at DESC
       LIMIT :lim OFFSET :off
     """
-    sql_total = f"SELECT count(*) FROM runs r WHERE {where_sql}"
 
     with engine.begin() as conn:
-        items = [dict(row) for row in conn.execute(text(sql), {**params, "start": start_dt, "end": end_dt}).mappings().all()]
-        total = int(conn.execute(text(sql_total), {**params, "start": start_dt, "end": end_dt}).scalar_one())
-    return {"total": total, "count": len(items), "items": items}
+        # どちらの方言でも start/end を常に渡す（未使用なら無視される）
+        base = {**params, "start": start_param, "end": end_param}
+        total = int(conn.execute(text(sql_total), base).scalar_one())
+        items = [dict(row) for row in conn.execute(text(sql), base).mappings().all()]
+        return {"total": total, "count": len(items), "items": items}
