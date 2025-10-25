@@ -82,15 +82,49 @@ def latest_run():
 @app.get("/predictions")
 def predictions(
     run_id: str = Query(...),
-    unique_id: str | None = Query(None),
+    unique_id: list[str] | None = Query(None),
     start: str | None = Query(None, description="ISO8601 UTC, e.g. 2025-01-01T00:00:00Z"),
     end: str | None = Query(None, description="ISO8601 UTC (exclusive)"),
     order: str = Query("asc", description="asc|desc"),
     limit: int = 1000,
     offset: int = 0
 ):
-    order_sql = "DESC" if str(order).lower() == "desc" else "ASC"
+    order_sql = "DESC" if str(order).lower() == "desc" else "ASC"\n    # --- multi-unique_id expansion ---\n    uids = []\n    if unique_id:\n        for u in (unique_id if isinstance(unique_id, list) else [unique_id]):\n            uids.extend([x.strip() for x in str(u).split(',') if x.strip()])\n    uids = list(dict.fromkeys(uids))  # de-dup\n    # 方言別 ds のISO8601Z整形
+    dialect = engine.url.get_backend_name()\n    if dialect == 'postgresql':\n        ds_expr = "to_char(ds AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS ds"\n    else:\n        ds_expr = "strftime('%Y-%m-%dT%H:%M:%SZ', ds) AS ds"\n
     dialect = engine.url.get_backend_name()
+    # 方言別の式
+    if dialect == 'postgresql':
+        created_expr = "to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at"
+        updated_expr = "to_char(r.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at"
+    else:
+        # sqlite: TEXT型DATETIME想定
+        created_expr = "strftime('%Y-%m-%dT%H:%M:%SZ', r.created_at) AS created_at"
+        updated_expr = "strftime('%Y-%m-%dT%H:%M:%SZ', r.updated_at) AS updated_at"
+    horizon_expr = "COALESCE((r.config #>> '{config,horizon}')::int, NULL) AS horizon" if dialect=='postgresql' else "CAST(json_extract(r.config,'$.config.horizon') AS INT) AS horizon"
+    n_pred_expr = "(SELECT count(*) FROM predictions p WHERE p.run_id=r.run_id) AS n_predictions"
+    _RUNS_WINDOW_COLSQL = {
+        'run_id': 'r.run_id',
+        'alias': 'r.alias',
+        'model_name': 'r.model_name',
+        'dataset': 'r.dataset',
+        'status': 'r.status',
+        'duration_sec': 'r.duration_sec',
+        'created_at': created_expr,
+        'updated_at': updated_expr,
+        'horizon': horizon_expr,
+        'n_predictions': n_pred_expr,
+    }
+    allowed = list(_RUNS_WINDOW_COLSQL.keys())
+    # fields パース（未指定なら全列）。常に run_id は含める。
+    if fields:
+        req = [x.strip() for x in fields.split(',') if x.strip() in allowed]
+        if 'run_id' not in req: req = ['run_id'] + req
+        if not req: req = allowed
+    else:
+        req = allowed
+    select_list = ', '.join(_RUNS_WINDOW_COLSQL[k] + f" AS {k}" if ' AS ' not in _RUNS_WINDOW_COLSQL[k] else _RUNS_WINDOW_COLSQL[k] for k in req)
+    # ↑ horizon/created_at/updated_at/n_predictions は式に AS が含まれるのでそのまま
+
     start_dt = _parse_utc_ceil(start)
     end_dt = _parse_utc_ceil(end)
 
@@ -264,10 +298,44 @@ def runs_window(
     status: str | None = Query(None),
     model_name: str | None = Query(None),
     alias: str | None = Query(None),
+    fields: str | None = Query(None, description="comma-separated: run_id,alias,model_name,dataset,status,duration_sec,created_at,updated_at,horizon,n_predictions"),
     limit: int = 50,
     offset: int = 0
 ):
     dialect = engine.url.get_backend_name()
+    # 方言別の式
+    if dialect == 'postgresql':
+        created_expr = "to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at"
+        updated_expr = "to_char(r.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at"
+    else:
+        # sqlite: TEXT型DATETIME想定
+        created_expr = "strftime('%Y-%m-%dT%H:%M:%SZ', r.created_at) AS created_at"
+        updated_expr = "strftime('%Y-%m-%dT%H:%M:%SZ', r.updated_at) AS updated_at"
+    horizon_expr = "COALESCE((r.config #>> '{config,horizon}')::int, NULL) AS horizon" if dialect=='postgresql' else "CAST(json_extract(r.config,'$.config.horizon') AS INT) AS horizon"
+    n_pred_expr = "(SELECT count(*) FROM predictions p WHERE p.run_id=r.run_id) AS n_predictions"
+    _RUNS_WINDOW_COLSQL = {
+        'run_id': 'r.run_id',
+        'alias': 'r.alias',
+        'model_name': 'r.model_name',
+        'dataset': 'r.dataset',
+        'status': 'r.status',
+        'duration_sec': 'r.duration_sec',
+        'created_at': created_expr,
+        'updated_at': updated_expr,
+        'horizon': horizon_expr,
+        'n_predictions': n_pred_expr,
+    }
+    allowed = list(_RUNS_WINDOW_COLSQL.keys())
+    # fields パース（未指定なら全列）。常に run_id は含める。
+    if fields:
+        req = [x.strip() for x in fields.split(',') if x.strip() in allowed]
+        if 'run_id' not in req: req = ['run_id'] + req
+        if not req: req = allowed
+    else:
+        req = allowed
+    select_list = ', '.join(_RUNS_WINDOW_COLSQL[k] + f" AS {k}" if ' AS ' not in _RUNS_WINDOW_COLSQL[k] else _RUNS_WINDOW_COLSQL[k] for k in req)
+    # ↑ horizon/created_at/updated_at/n_predictions は式に AS が含まれるのでそのまま
+
     start_dt = _parse_utc_ceil(start)
     end_dt = _parse_utc_ceil(end)
 
