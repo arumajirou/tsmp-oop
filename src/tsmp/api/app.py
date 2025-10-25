@@ -244,8 +244,8 @@ def runs_window(
         params["status"] = status
 
     if dialect == "postgresql":
-        if start_dt: params["start"] = start_dt; where.append("r.created_at >= :start::timestamptz")
-        if end_dt:   params["end"]   = end_dt;   where.append("r.created_at <  :end::timestamptz")
+        if start_dt: params["start"] = start_dt; where.append("r.created_at >= CAST(:start AS timestamptz)")
+        if end_dt:   params["end"]   = end_dt;   where.append("r.created_at <  CAST(:end   AS timestamptz)")
         ts_cols = "to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, to_char(r.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at"
         horizon_sql = "COALESCE((r.config #>> '{config,horizon}')::int, NULL) AS horizon,"
     else:
@@ -270,6 +270,6 @@ def runs_window(
     sql_total = f"SELECT count(*) FROM runs r WHERE {where_sql}"
 
     with engine.begin() as conn:
-        items = [dict(row) for row in conn.execute(text(sql), params).mappings().all()]
-        total = int(conn.execute(text(sql_total), params).scalar_one())
+        items = [dict(row) for row in conn.execute(text(sql), {**params, "start": start_dt, "end": end_dt}).mappings().all()]
+        total = int(conn.execute(text(sql_total), {**params, "start": start_dt, "end": end_dt}).scalar_one())
     return {"total": total, "count": len(items), "items": items}
