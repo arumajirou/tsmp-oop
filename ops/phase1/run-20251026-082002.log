@@ -1,0 +1,1 @@
+{"run_id": "60b335188557", "duration_sec": 0.0008592605590820312, "dq": {"n_rows": 120, "missing_rate": 0.0}, "predictions_rows": 14, "context": {"cpu_percent": 0.0, "memory_mb": 124.71484375}}
