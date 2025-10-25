@@ -1,0 +1,387 @@
+{
+  "modules": {
+    "tsmp.__init__": {
+      "path": "src/tsmp/__init__.py",
+      "classes": [],
+      "functions": [],
+      "imports_top": []
+    },
+    "tsmp.features.registry": {
+      "path": "src/tsmp/features/registry.py",
+      "classes": [],
+      "functions": [
+        "build_features",
+        "run_features"
+      ],
+      "imports_top": [
+        "base",
+        "typing"
+      ]
+    },
+    "tsmp.features.base": {
+      "path": "src/tsmp/features/base.py",
+      "classes": [
+        "DayOfWeekFeature",
+        "Feature",
+        "LagFeature"
+      ],
+      "functions": [
+        "__init__",
+        "apply"
+      ],
+      "imports_top": [
+        "abc",
+        "pandas",
+        "typing"
+      ]
+    },
+    "tsmp.features.__init__": {
+      "path": "src/tsmp/features/__init__.py",
+      "classes": [],
+      "functions": [],
+      "imports_top": []
+    },
+    "tsmp.orchestration.constraints": {
+      "path": "src/tsmp/orchestration/constraints.py",
+      "classes": [
+        "NonLocalConstraintSolver"
+      ],
+      "functions": [
+        "apply"
+      ],
+      "imports_top": [
+        "core",
+        "typing"
+      ]
+    },
+    "tsmp.orchestration.__init__": {
+      "path": "src/tsmp/orchestration/__init__.py",
+      "classes": [],
+      "functions": [],
+      "imports_top": []
+    },
+    "tsmp.orchestration.pipeline": {
+      "path": "src/tsmp/orchestration/pipeline.py",
+      "classes": [
+        "Pipeline"
+      ],
+      "functions": [
+        "__init__",
+        "run"
+      ],
+      "imports_top": [
+        "core",
+        "data",
+        "features",
+        "modeling",
+        "monitoring",
+        "numpy",
+        "orchestration",
+        "pandas",
+        "typing",
+        "yaml"
+      ]
+    },
+    "tsmp.orchestration.context_adapter": {
+      "path": "src/tsmp/orchestration/context_adapter.py",
+      "classes": [
+        "ContextAdapter"
+      ],
+      "functions": [
+        "adapt"
+      ],
+      "imports_top": [
+        "typing"
+      ]
+    },
+    "tsmp.analysis.shap_analyzer": {
+      "path": "src/tsmp/analysis/shap_analyzer.py",
+      "classes": [],
+      "functions": [],
+      "imports_top": [
+        "base"
+      ]
+    },
+    "tsmp.analysis.base": {
+      "path": "src/tsmp/analysis/base.py",
+      "classes": [
+        "Analyzer"
+      ],
+      "functions": [
+        "analyze"
+      ],
+      "imports_top": [
+        "pandas",
+        "typing"
+      ]
+    },
+    "tsmp.analysis.__init__": {
+      "path": "src/tsmp/analysis/__init__.py",
+      "classes": [],
+      "functions": [],
+      "imports_top": []
+    },
+    "tsmp.tracking.mlflow_tracker": {
+      "path": "src/tsmp/tracking/mlflow_tracker.py",
+      "classes": [
+        "Tracker"
+      ],
+      "functions": [
+        "__init__",
+        "end",
+        "log_metrics",
+        "log_params",
+        "start"
+      ],
+      "imports_top": [
+        "mlflow",
+        "os",
+        "typing"
+      ]
+    },
+    "tsmp.tracking.__init__": {
+      "path": "src/tsmp/tracking/__init__.py",
+      "classes": [],
+      "functions": [],
+      "imports_top": []
+    },
+    "tsmp.core.logging": {
+      "path": "src/tsmp/core/logging.py",
+      "classes": [],
+      "functions": [
+        "setup_logging"
+      ],
+      "imports_top": [
+        "logging",
+        "os",
+        "sys"
+      ]
+    },
+    "tsmp.core.config": {
+      "path": "src/tsmp/core/config.py",
+      "classes": [
+        "ConstraintRule",
+        "ConstraintSpec",
+        "FeatureConfig",
+        "RunConfig"
+      ],
+      "functions": [],
+      "imports_top": [
+        "pydantic",
+        "typing"
+      ]
+    },
+    "tsmp.core.__init__": {
+      "path": "src/tsmp/core/__init__.py",
+      "classes": [],
+      "functions": [],
+      "imports_top": []
+    },
+    "tsmp.core.container": {
+      "path": "src/tsmp/core/container.py",
+      "classes": [
+        "Container"
+      ],
+      "functions": [
+        "__init__",
+        "register_factory",
+        "register_singleton",
+        "resolve"
+      ],
+      "imports_top": [
+        "typing"
+      ]
+    },
+    "tsmp.core.events": {
+      "path": "src/tsmp/core/events.py",
+      "classes": [
+        "Event"
+      ],
+      "functions": [],
+      "imports_top": [
+        "dataclasses",
+        "typing"
+      ]
+    },
+    "tsmp.modeling.neuralforecast_impl": {
+      "path": "src/tsmp/modeling/neuralforecast_impl.py",
+      "classes": [
+        "BaselineMean"
+      ],
+      "functions": [
+        "fit",
+        "predict"
+      ],
+      "imports_top": [
+        "base",
+        "pandas",
+        "typing"
+      ]
+    },
+    "tsmp.modeling.capability": {
+      "path": "src/tsmp/modeling/capability.py",
+      "classes": [
+        "CapabilityValidator"
+      ],
+      "functions": [
+        "__init__",
+        "validate"
+      ],
+      "imports_top": [
+        "typing",
+        "yaml"
+      ]
+    },
+    "tsmp.modeling.runner": {
+      "path": "src/tsmp/modeling/runner.py",
+      "classes": [
+        "RunResult",
+        "TrainingSession"
+      ],
+      "functions": [
+        "__init__",
+        "run"
+      ],
+      "imports_top": [
+        "base",
+        "dataclasses",
+        "neuralforecast_impl",
+        "pandas",
+        "time",
+        "typing",
+        "uuid"
+      ]
+    },
+    "tsmp.modeling.base": {
+      "path": "src/tsmp/modeling/base.py",
+      "classes": [
+        "AbstractModel"
+      ],
+      "functions": [
+        "__init__",
+        "fit",
+        "predict"
+      ],
+      "imports_top": [
+        "abc",
+        "pandas",
+        "typing"
+      ]
+    },
+    "tsmp.modeling.hpo": {
+      "path": "src/tsmp/modeling/hpo.py",
+      "classes": [
+        "NoOpHPO"
+      ],
+      "functions": [
+        "run"
+      ],
+      "imports_top": [
+        "typing"
+      ]
+    },
+    "tsmp.modeling.__init__": {
+      "path": "src/tsmp/modeling/__init__.py",
+      "classes": [],
+      "functions": [],
+      "imports_top": []
+    },
+    "tsmp.api.__init__": {
+      "path": "src/tsmp/api/__init__.py",
+      "classes": [],
+      "functions": [],
+      "imports_top": []
+    },
+    "tsmp.api.app": {
+      "path": "src/tsmp/api/app.py",
+      "classes": [],
+      "functions": [
+        "health"
+      ],
+      "imports_top": [
+        "fastapi"
+      ]
+    },
+    "tsmp.monitoring.resource": {
+      "path": "src/tsmp/monitoring/resource.py",
+      "classes": [
+        "ResourceMonitor"
+      ],
+      "functions": [
+        "__init__",
+        "snapshot"
+      ],
+      "imports_top": [
+        "os",
+        "psutil",
+        "time",
+        "typing"
+      ]
+    },
+    "tsmp.monitoring.__init__": {
+      "path": "src/tsmp/monitoring/__init__.py",
+      "classes": [],
+      "functions": [],
+      "imports_top": []
+    },
+    "tsmp.data.repository": {
+      "path": "src/tsmp/data/repository.py",
+      "classes": [
+        "AbstractRepository",
+        "ParquetRepository",
+        "SQLRepository"
+      ],
+      "functions": [
+        "__init__",
+        "load_observations",
+        "save_predictions"
+      ],
+      "imports_top": [
+        "abc",
+        "pandas",
+        "sqlalchemy",
+        "typing"
+      ]
+    },
+    "tsmp.data.quality": {
+      "path": "src/tsmp/data/quality.py",
+      "classes": [
+        "DataQualityService"
+      ],
+      "functions": [
+        "profile"
+      ],
+      "imports_top": [
+        "pandas",
+        "typing"
+      ]
+    },
+    "tsmp.data.entities": {
+      "path": "src/tsmp/data/entities.py",
+      "classes": [
+        "Observation"
+      ],
+      "functions": [],
+      "imports_top": [
+        "dataclasses",
+        "datetime"
+      ]
+    },
+    "tsmp.data.ingestion": {
+      "path": "src/tsmp/data/ingestion.py",
+      "classes": [
+        "IngestionResult"
+      ],
+      "functions": [],
+      "imports_top": [
+        "dataclasses"
+      ]
+    },
+    "tsmp.data.__init__": {
+      "path": "src/tsmp/data/__init__.py",
+      "classes": [],
+      "functions": [],
+      "imports_top": []
+    }
+  }
+}
