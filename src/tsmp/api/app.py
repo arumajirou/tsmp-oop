@@ -1,5 +1,6 @@
 # src/tsmp/api/app.py
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
 import os
 from sqlalchemy import create_engine, text
