@@ -75,24 +75,54 @@ def latest_run():
         d['mlflow'] = _mlflow_hint(d['run_id'])
         return d
 
+
 @app.get("/predictions")
-def predictions(run_id: str = Query(...), unique_id: str | None = Query(None), limit: int = 1000, offset: int = 0):
-    sql = """
-      SELECT unique_id, to_char(ds AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS ds, y_hat
+def predictions(
+    run_id: str = Query(...),
+    unique_id: str | None = Query(None),
+    start: str | None = Query(None, description="ISO8601 UTC, e.g. 2025-01-01T00:00:00Z"),
+    end: str | None = Query(None, description="ISO8601 UTC (exclusive)"),
+    order: str = Query("asc", description="asc|desc"),
+    limit: int = 1000,
+    offset: int = 0
+):
+    order_sql = "DESC" if str(order).lower() == "desc" else "ASC"
+    dialect = engine.url.get_backend_name()
+    # 再利用: _parse_utc_ceil は既に定義済み
+    start_dt = _parse_utc_ceil(start)
+    end_dt = _parse_utc_ceil(end)
+
+    params = {"rid": run_id, "uid": unique_id, "lim": limit, "off": offset,
+              "pstart": start_dt, "pend": end_dt}
+
+    where = ["run_id = :rid", "(:uid IS NULL OR unique_id = :uid)"]
+    if dialect == "postgresql":
+        if start_dt is not None:
+            where.append("ds >= CAST(:pstart AS timestamptz)")
+        if end_dt is not None:
+            where.append("ds <  CAST(:pend   AS timestamptz)")
+        ts_select = "to_char(ds AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS ds"
+    else:
+        # sqlite: ds は "YYYY-MM-DD HH:MM:SS" 想定（init_schema.sqlに準拠）
+        if start_dt is not None:
+            params["pstart"] = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+            where.append("ds >= :pstart")
+        if end_dt is not None:
+            params["pend"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+            where.append("ds <  :pend")
+        ts_select = "ds AS ds"
+
+    where_sql = " AND ".join(where)
+    sql = f"""
+      SELECT unique_id, {ts_select}, y_hat
       FROM predictions
-      WHERE run_id = :rid AND (:uid IS NULL OR unique_id = :uid)
-      ORDER BY ds
+      WHERE {where_sql}
+      ORDER BY ds {order_sql}
       LIMIT :lim OFFSET :off
     """
     with engine.begin() as conn:
-        rows = conn.execute(text(sql), {"rid": run_id, "uid": unique_id, "lim": limit, "off": offset}).mappings().all()
+        rows = conn.execute(text(sql), params).mappings().all()
         return {"run_id": run_id, "count": len(rows), "items": [dict(r) for r in rows]}
-
-from fastapi import status
-import math
-
-KPI_DURATION_P95_MS = int(os.getenv("KPI_DURATION_P95_MS", "5000"))
-KPI_PREDICTIONS_RATIO = float(os.getenv("KPI_PREDICTIONS_RATIO", "1.0"))
 
 @app.get("/health")
 def health():
@@ -230,6 +260,13 @@ def runs_window(
     start: str | None = Query(None, description="ISO8601 UTC, e.g. 2025-01-01T00:00:00Z"),
     end: str | None = Query(None, description="ISO8601 UTC (exclusive)"),
     status: str | None = Query(None),
+    model_name: str | None = Query(None),
+    alias: str | None = Query(None),
+    limit: int = 50,
+    offset: int = 0
+),
+    end: str | None = Query(None, description="ISO8601 UTC (exclusive)"),
+    status: str | None = Query(None),
     limit: int = 50,
     offset: int = 0
 ):
@@ -242,6 +279,12 @@ def runs_window(
     if status:
         where.append("r.status = :status")
         params["status"] = status
+    if model_name:
+        where.append("r.model_name = :model_name")
+        params["model_name"] = model_name
+    if alias:
+        where.append("r.alias = :alias")
+        params["alias"] = alias
 
     if dialect == "postgresql":
         if start_dt: params["start"] = start_dt; where.append("r.created_at >= CAST(:start AS timestamptz)")
