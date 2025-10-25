@@ -55,8 +55,10 @@ class RunRow(BaseModel):
 def latest_run():
     sql = """
       SELECT r.run_id, r.alias, r.model_name, r.dataset, r.status, r.duration_sec,
-             r.created_at::text, r.updated_at::text,
-             COALESCE((r.config #>> '{config,horizon}')::int, NULL) AS horizon
+             to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+             to_char(r.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at,
+             COALESCE((r.config #>> '{config,horizon}')::int, NULL) AS horizon,
+             (SELECT count(*) FROM predictions p WHERE p.run_id=r.run_id) AS n_predictions
       FROM runs r
       ORDER BY created_at DESC
       LIMIT 1
@@ -69,16 +71,16 @@ def latest_run():
         return d
 
 @app.get("/predictions")
-def predictions(run_id: str = Query(...), limit: int = 1000, offset: int = 0):
+def predictions(run_id: str = Query(...), unique_id: str | None = Query(None), limit: int = 1000, offset: int = 0):
     sql = """
       SELECT unique_id, to_char(ds AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS ds, y_hat
       FROM predictions
-      WHERE run_id = :rid
+      WHERE run_id = :rid AND (:uid IS NULL OR unique_id = :uid)
       ORDER BY ds
       LIMIT :lim OFFSET :off
     """
     with engine.begin() as conn:
-        rows = conn.execute(text(sql), {"rid": run_id, "lim": limit, "off": offset}).mappings().all()
+        rows = conn.execute(text(sql), {"rid": run_id, "uid": unique_id, "lim": limit, "off": offset}).mappings().all()
         return {"run_id": run_id, "count": len(rows), "items": [dict(r) for r in rows]}
 
 from fastapi import status
@@ -185,8 +187,10 @@ def list_runs(limit: int = Query(100, ge=1, le=1000),
               status: str | None = Query(None)):
     sql_items = """
       SELECT r.run_id, r.alias, r.model_name, r.dataset, r.status, r.duration_sec,
-             r.created_at::text, r.updated_at::text,
-             COALESCE((r.config #>> '{config,horizon}')::int, NULL) AS horizon
+             to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+             to_char(r.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at,
+             COALESCE((r.config #>> '{config,horizon}')::int, NULL) AS horizon,
+             (SELECT count(*) FROM predictions p WHERE p.run_id=r.run_id) AS n_predictions
       FROM runs r
       WHERE (:status IS NULL OR r.status = :status)
       ORDER BY r.created_at DESC
