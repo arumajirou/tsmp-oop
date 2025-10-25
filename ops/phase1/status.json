@@ -2,29 +2,31 @@
   "goals": [
     "Dry-runで主要経路の時間・件数・ログ採取",
     "構造/依存の把握（JSON/DOT）",
-    "ローカルPostgresでのE2E整備"
+    "ローカルPostgresでのE2E整備（runs+predictions）"
   ],
   "acceptance_criteria": [
     "cli runがPostgresで完走",
     "outputs/last_run.json が保存",
     "metrics-*.json が生成",
-    "runs テーブルに1行以上が存在"
+    "runs/predictions テーブルに行が存在",
+    "pytest（sqlite代替）がグリーン"
   ],
   "plan": [
     "DB初期化/検証",
     "JSON成果物/抽出器の堅牢化",
     "MLflow連携の有効化",
-    "状態/進捗の可視化",
-    "runs 書き戻し（UPSERT）"
+    "runs/predictions 書き戻し（UPSERT）",
+    "CIで契約テストを常時回す"
   ],
   "actions": [
     "setup_db.py --init(postgresql:///tsmodeling)",
-    "cli.py: with_mlflow & JSON保存",
-    "extract_metrics: JSON優先+バランス抽出",
-    "persist_to_db.py: runs/predictions UPSERT（predは任意）"
+    "cli.py: with_mlflow & --persist-db",
+    "persist_to_db.py: UPSERT (runs/predictions)",
+    "views.sql: run_summary, predictions_per_run",
+    "tests: test_db_contract, test_predictions_contract",
+    "GH Actions: pytest (sqlite)"
   ],
   "findings": {
-    "metrics_file": "ops/phase1/metrics_last_path.txt",
     "artifacts": [
       "outputs/last_run.json",
       "ops/phase1/metrics-*.json",
@@ -32,17 +34,17 @@
       "ops/phase1/imports.dot(,svg)",
       "plan/progress.md",
       "mlruns/",
-      "DB: runs/predictions"
+      "DB: runs/predictions (+ views)"
     ]
   },
   "risks": [
-    "本番スキーマ差異",
+    "本番権限差異",
     "MLflow URI 切替忘れ",
-    "予測スキーマ差異（列名/型）"
+    "予測スキーマ逸脱（unique_id/ds/y_hat）"
   ],
   "next": [
-    "predictions 書き戻しの標準スキーマ決定（unique_id, ds, y_hat）",
-    "Pipeline 側で predictions.parquet を常時出力（再現性向上）",
-    "CIにpytestワークフロー導入（DB=sqliteで代替）"
+    "KPI定義（例: duration_sec p95, n_predictions>=horizon*系列数）と閾値化",
+    "MLflow にDB連携メタデータをタグ/アーティファクトとして集約",
+    "API 層（FastAPI）から最新run/予測を閲覧するエンドポイントの追加"
   ]
 }
