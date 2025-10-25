@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict
 import os
 from sqlalchemy import create_engine, text
 from fastapi.responses import JSONResponse
+from datetime import datetime, timezone
 
 app = FastAPI(title="tsmp-oop")
 
@@ -134,6 +135,7 @@ def health():
             "latest_run_id": latest_run
         }
     }
+    payload["thresholds"] = {"duration_p95_ms": KPI_DURATION_P95_MS, "predictions_ratio": KPI_PREDICTIONS_RATIO}
     return JSONResponse(content=payload, status_code=status_code)
 
 
@@ -184,6 +186,7 @@ def health():
             "latest_run_id": latest_run
         }
     }
+    payload["thresholds"] = {"duration_p95_ms": KPI_DURATION_P95_MS, "predictions_ratio": KPI_PREDICTIONS_RATIO}
     return JSONResponse(content=payload, status_code=status_code)
 
 
@@ -209,4 +212,64 @@ def list_runs(limit: int = Query(100, ge=1, le=1000),
     with engine.begin() as conn:
         items = [dict(m) for m in conn.execute(text(sql_items), {"status": status, "lim": limit, "off": offset}).mappings().all()]
         total = int(conn.execute(text(sql_cnt), {"status": status}).scalar_one())
+    return {"total": total, "count": len(items), "items": items}
+
+def _parse_utc_ceil(s: str|None):
+    if not s: return None
+    t = s.replace("Z","").replace("z","")
+    try:
+        dt = datetime.fromisoformat(t)
+    except Exception:
+        return None
+    if dt.tzinfo:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+@app.get("/runs/window")
+def runs_window(
+    start: str | None = Query(None, description="ISO8601 UTC, e.g. 2025-01-01T00:00:00Z"),
+    end: str | None = Query(None, description="ISO8601 UTC (exclusive)"),
+    status: str | None = Query(None),
+    limit: int = 50,
+    offset: int = 0
+):
+    dialect = engine.url.get_backend_name()
+    start_dt = _parse_utc_ceil(start)
+    end_dt = _parse_utc_ceil(end)
+
+    params = {"lim": limit, "off": offset}
+    where = []
+    if status:
+        where.append("r.status = :status")
+        params["status"] = status
+
+    if dialect == "postgresql":
+        if start_dt: params["start"] = start_dt; where.append("r.created_at >= :start::timestamptz")
+        if end_dt:   params["end"]   = end_dt;   where.append("r.created_at <  :end::timestamptz")
+        ts_cols = "to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, to_char(r.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at"
+        horizon_sql = "COALESCE((r.config #>> '{config,horizon}')::int, NULL) AS horizon,"
+    else:
+        # sqlite: TEXT比較。UTC整形はそのまま返す
+        if start_dt: params["start"] = start_dt.strftime("%Y-%m-%d %H:%M:%S"); where.append("r.created_at >= :start")
+        if end_dt:   params["end"]   = end_dt.strftime("%Y-%m-%d %H:%M:%S");   where.append("r.created_at <  :end")
+        ts_cols = "r.created_at AS created_at, r.updated_at AS updated_at"
+        horizon_sql = "NULL AS horizon,"
+
+    where_sql = " AND ".join(where) if where else "1=1"
+
+    sql = f"""
+      SELECT r.run_id, r.alias, r.model_name, r.dataset, r.status, r.duration_sec,
+             {ts_cols},
+             {horizon_sql}
+             (SELECT count(*) FROM predictions p WHERE p.run_id=r.run_id) AS n_predictions
+      FROM runs r
+      WHERE {where_sql}
+      ORDER BY r.created_at DESC
+      LIMIT :lim OFFSET :off
+    """
+    sql_total = f"SELECT count(*) FROM runs r WHERE {where_sql}"
+
+    with engine.begin() as conn:
+        items = [dict(row) for row in conn.execute(text(sql), params).mappings().all()]
+        total = int(conn.execute(text(sql_total), params).scalar_one())
     return {"total": total, "count": len(items), "items": items}
