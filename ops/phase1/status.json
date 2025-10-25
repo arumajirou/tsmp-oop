@@ -7,37 +7,42 @@
   "acceptance_criteria": [
     "cli runがPostgresで完走",
     "outputs/last_run.json が保存",
-    "metrics-*.json が生成"
+    "metrics-*.json が生成",
+    "runs テーブルに1行以上が存在"
   ],
   "plan": [
     "DB初期化/検証",
     "JSON成果物/抽出器の堅牢化",
     "MLflow連携の有効化",
-    "状態/進捗の可視化"
+    "状態/進捗の可視化",
+    "runs 書き戻し（UPSERT）"
   ],
   "actions": [
     "setup_db.py --init(postgresql:///tsmodeling)",
     "cli.py: with_mlflow & JSON保存",
-    "extract_metrics: JSON優先+バランス抽出"
+    "extract_metrics: JSON優先+バランス抽出",
+    "persist_to_db.py: runs/predictions UPSERT（predは任意）"
   ],
   "findings": {
-    "metrics_file": "ops/phase1/metrics-1761434232384137265.json",
+    "metrics_file": "ops/phase1/metrics_last_path.txt",
     "artifacts": [
       "outputs/last_run.json",
       "ops/phase1/metrics-*.json",
       "ops/phase1/run-*.log",
       "ops/phase1/imports.dot(,svg)",
       "plan/progress.md",
-      "mlruns/"
+      "mlruns/",
+      "DB: runs/predictions"
     ]
   },
   "risks": [
     "本番スキーマ差異",
-    "MLflow URI の切替忘れ"
+    "MLflow URI 切替忘れ",
+    "予測スキーマ差異（列名/型）"
   ],
   "next": [
-    "DBに予測書き込みのE2E追加",
-    "監視メトリクス定義とダッシュ草案",
-    "CIにpytestワークフロー導入"
+    "predictions 書き戻しの標準スキーマ決定（unique_id, ds, y_hat）",
+    "Pipeline 側で predictions.parquet を常時出力（再現性向上）",
+    "CIにpytestワークフロー導入（DB=sqliteで代替）"
   ]
 }
