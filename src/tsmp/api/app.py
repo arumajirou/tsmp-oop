@@ -78,6 +78,7 @@ def latest_run():
 
 
 
+
 @app.get("/predictions")
 def predictions(
     run_id: str = Query(...),
@@ -106,7 +107,6 @@ def predictions(
             params["pstart"] = start_dt.strftime("%Y-%m-%d %H:%M:%S"); where.append("ds >= :pstart")
         if end_dt is not None:
             params["pend"] = end_dt.strftime("%Y-%m-%d %H:%M:%S");   where.append("ds <  :pend")
-        # SQLite でも ISO8601Z を生成
         ts_select = "replace(ds,' ','T')||'Z' AS ds"
         pstart, pend = params.get("pstart"), params.get("pend")
 
@@ -256,6 +256,7 @@ def _parse_utc_ceil(s: str|None):
 
 
 
+
 @app.get("/runs/window")
 def runs_window(
     start: str | None = Query(None, description="ISO8601 UTC, e.g. 2025-01-01T00:00:00Z"),
@@ -273,14 +274,11 @@ def runs_window(
     params: dict = {"lim": limit, "off": offset}
     where = ["1=1"]
     if status:
-        where.append("r.status = :status")
-        params["status"] = status
+        where.append("r.status = :status"); params["status"] = status
     if model_name:
-        where.append("r.model_name = :model_name")
-        params["model_name"] = model_name
+        where.append("r.model_name = :model_name"); params["model_name"] = model_name
     if alias:
-        where.append("r.alias = :alias")
-        params["alias"] = alias
+        where.append("r.alias = :alias"); params["alias"] = alias
 
     if dialect == "postgresql":
         if start_dt is not None: where.append("r.created_at >= CAST(:start AS timestamptz)")
@@ -290,7 +288,7 @@ def runs_window(
         horizon_sql = "COALESCE((r.config #>> '{config,horizon}')::int, NULL) AS horizon"
         start_param, end_param = start_dt, end_dt
     else:
-        # SQLite: 文字列比較 + ISO8601Z を生成（' ' → 'T'、末尾にZ）
+        # SQLite: 文字列比較 & ISO8601Z 生成
         if start_dt is not None:
             params["start"] = start_dt.strftime("%Y-%m-%d %H:%M:%S"); where.append("r.created_at >= :start")
         if end_dt is not None:
