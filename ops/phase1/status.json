@@ -1,18 +1,18 @@
 {
-  "goals": ["Dry-runで主要経路の時間・件数・ログ採取", "構造/依存の把握", "即時障害の除去"],
-  "acceptance_criteria": ["cli runがエラーなく完走", "構造JSON/DOTが生成され保存", "進捗表が作成・コミット済"],
-  "plan": ["不具合修正", "構造解析(JSON/DOT)", "Dry-run実行と計測", "進捗表と履歴を残す"],
-  "actions": ["config.py修正", "setup_db.pyに--init追加", "inspect_repo.py/dep_graph.pyで構造収集", "runログからメトリクス抽出"],
+  "goals": ["Dry-runで主要経路の時間・件数・ログ採取", "構造/依存の把握（JSON/DOT）", "ローカルPostgresでのE2E整備"],
+  "acceptance_criteria": ["cli runがPostgresで完走", "outputs/last_run.json が保存", "metrics-*.json が生成"],
+  "plan": ["DB初期化/検証", "JSON成果物/抽出器の堅牢化", "MLflow連携の有効化", "状態/進捗の可視化"],
+  "actions": ["setup_db.py --init(postgresql:///tsmodeling)", "cli.pyに--with-mlflow追加とJSON保存", "extract_metricsの堅牢化"],
   "findings": {
     "metrics_file": "",
     "artifacts": [
-      "ops/phase1/structure-*.json",
-      "ops/phase1/imports.dot",
-      "ops/phase1/imports.svg",
+      "outputs/last_run.json",
+      "ops/phase1/metrics-*.json",
       "ops/phase1/run-*.log",
+      "ops/phase1/imports.dot(,svg)",
       "plan/progress.md"
     ]
   },
-  "risks": ["Dry-runが実データ負荷を代表しない", "MLflow/DBの権限差異"],
-  "next": ["MLflow連携Dry-run（トラッキング確認）", "DB 永続化 E2E（予測保存）", "監視メトリクス定義とダッシュ草案"]
+  "risks": ["本番スキーマ差異", "MLflow URI の切替忘れ"],
+  "next": ["DBに予測書き込みのE2E追加", "監視メトリクス定義とダッシュ草案", "CIにpytestワークフロー導入"]
 }
