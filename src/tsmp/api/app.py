@@ -6,6 +6,8 @@ from sqlalchemy import create_engine, text
 
 app = FastAPI(title="tsmp-oop")
 
+app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
+
 DSN = os.getenv("POSTGRES_DSN", "postgresql:///tsmodeling")
 engine = create_engine(DSN, pool_pre_ping=True)
 
