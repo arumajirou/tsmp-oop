@@ -39,7 +39,7 @@ def latest_run():
 @app.get("/predictions")
 def predictions(run_id: str = Query(...), limit: int = 1000, offset: int = 0):
     sql = """
-      SELECT unique_id, ds::text as ds, y_hat
+      SELECT unique_id, to_char(ds AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS ds, y_hat
       FROM predictions
       WHERE run_id = :rid
       ORDER BY ds
