@@ -9,8 +9,38 @@ app = FastAPI(title="tsmp-oop")
 DSN = os.getenv("POSTGRES_DSN", "postgresql:///tsmodeling")
 engine = create_engine(DSN, pool_pre_ping=True)
 
+def _mlflow_hint(run_name: str) -> dict | None:
+    """run_name(=DBのrun_id)で MLflow UI の検索URLを組む。
+    前提:
+      - MLFLOW_UI_BASE (例: http://127.0.0.1:5000)
+      - MLFLOW_EXPERIMENT_NAME (既定 'tsmp-oop')
+      - mlflow が import 可能なら experiment_id を解決して実験内検索URLを返す
+      - 無ければ UI ベースだけ返す
+    """
+    base = os.getenv("MLFLOW_UI_BASE")
+    tracking = os.getenv("MLFLOW_TRACKING_URI")
+    exp_name = os.getenv("MLFLOW_EXPERIMENT_NAME", "tsmp-oop")
+    if not base:
+        return {"tracking_uri": tracking, "experiment": exp_name, "ui_url": None}
+
+    ui_url = None
+    try:
+        import mlflow  # optional
+        exp = mlflow.get_experiment_by_name(exp_name)
+        if exp and getattr(exp, "experiment_id", None):
+            from urllib.parse import quote
+            q = quote(f"attributes.run_name = '{run_name}'", safe="")
+            ui_url = f"{base}/#/experiments/{exp.experiment_id}/s?searchFilter={q}"
+        else:
+            ui_url = base
+    except Exception:
+        ui_url = base
+
+    return {"tracking_uri": tracking, "experiment": exp_name, "ui_url": ui_url}
+
 class RunRow(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
+    mlflow: dict | None = None
     run_id: str
     alias: str
     model_name: str
@@ -34,7 +64,9 @@ def latest_run():
     with engine.begin() as conn:
         row = conn.execute(text(sql)).mappings().first()
         if not row: raise HTTPException(404, "no runs")
-        return dict(row)
+        d = dict(row)
+        d['mlflow'] = _mlflow_hint(d['run_id'])
+        return d
 
 @app.get("/predictions")
 def predictions(run_id: str = Query(...), limit: int = 1000, offset: int = 0):
@@ -145,3 +177,26 @@ def health():
             "latest_run_id": latest_run
         }
     }, status_code
+
+
+@app.get("/runs")
+def list_runs(limit: int = Query(100, ge=1, le=1000),
+              offset: int = Query(0, ge=0),
+              status: str | None = Query(None)):
+    sql_items = """
+      SELECT r.run_id, r.alias, r.model_name, r.dataset, r.status, r.duration_sec,
+             r.created_at::text, r.updated_at::text,
+             COALESCE((r.config #>> '{config,horizon}')::int, NULL) AS horizon
+      FROM runs r
+      WHERE (:status IS NULL OR r.status = :status)
+      ORDER BY r.created_at DESC
+      LIMIT :lim OFFSET :off
+    """
+    sql_cnt = """
+      SELECT count(*) FROM runs r
+      WHERE (:status IS NULL OR r.status = :status)
+    """
+    with engine.begin() as conn:
+        items = [dict(m) for m in conn.execute(text(sql_items), {"status": status, "lim": limit, "off": offset}).mappings().all()]
+        total = int(conn.execute(text(sql_cnt), {"status": status}).scalar_one())
+    return {"total": total, "count": len(items), "items": items}
