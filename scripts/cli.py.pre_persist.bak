@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-import argparse, json, os, subprocess, sys
+import argparse, json, os
 from pathlib import Path
 
 from tsmp.orchestration.pipeline import Pipeline
@@ -10,7 +10,9 @@ def run_once(run_config, fe_config, constraints, capabilities_path):
       新: Pipeline(run_config_path=..., feature_config_path=..., constraints_path=..., model_capability_path=...) -> .run()
       旧: Pipeline(model_capability_path=...) -> .run(run_config, fe_config, constraints)
     """
+    # 可能なら capabilities を渡す
     cap_path = capabilities_path if capabilities_path else None
+    # 新APIトライ
     try:
         pipe = Pipeline(run_config_path=run_config,
                         feature_config_path=fe_config,
@@ -18,6 +20,7 @@ def run_once(run_config, fe_config, constraints, capabilities_path):
                         model_capability_path=cap_path)
         return pipe.run()
     except TypeError:
+        # 旧APIフォールバック
         pipe = Pipeline(model_capability_path=cap_path) if cap_path else Pipeline()
         return pipe.run(run_config, fe_config, constraints)
 
@@ -29,25 +32,22 @@ def main():
     spr.add_argument("--run-config", default="configs/run_spec.yaml")
     spr.add_argument("--fe-config", default="configs/fe_config.yaml")
     spr.add_argument("--constraints", default="configs/constraints.yaml")
+    # 旧デフォルトを復活して下位互換性を確保
     spr.add_argument("--capabilities", default="configs/model_capability.yaml")
     spr.add_argument("--with-mlflow", action="store_true",
                      help="log to MLflow if MLFLOW_TRACKING_URI is configured")
-    spr.add_argument("--persist-db", action="store_true",
-                     help="after run, persist to DB using scripts/persist_to_db.py")
-    spr.add_argument("--dsn", default=os.getenv("POSTGRES_DSN", "postgresql:///tsmodeling"))
-    spr.add_argument("--pred-file", default="outputs/predictions.parquet")
 
     args = ap.parse_args()
 
     if args.cmd == "run":
         result = run_once(args.run_config, args.fe_config, args.constraints, args.capabilities)
 
-        # 成果物: JSON を outputs/last_run.json に保存
+        # 成果物: JSON を outputs/last_run.json に保存（機械可読）
         Path("outputs").mkdir(parents=True, exist_ok=True)
         out_path = Path("outputs/last_run.json")
         out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        # MLflow 記録
+        # 必要に応じて MLflow へ記録
         if args.with_mlflow:
             try:
                 import mlflow
@@ -65,19 +65,7 @@ def main():
             except Exception as e:
                 print(f"[warn] MLflow logging skipped: {e}")
 
-        # DB 永続化（任意）
-        if args.persist_db:
-            try:
-                subprocess.run([sys.executable, "scripts/persist_to_db.py",
-                                "--dsn", args.dsn,
-                                "--run-json", "outputs/last_run.json",
-                                "--run-config", args.run_config,
-                                "--pred-file", args.pred_file],
-                               check=True)
-            except Exception as e:
-                print(f"[warn] persist_to_db failed: {e}")
-
-        # 終了出力（機械可読）
+        # 標準出力にも JSON
         print(json.dumps(result, ensure_ascii=False))
 
 if __name__ == "__main__":
