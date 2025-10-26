@@ -1,5 +1,5 @@
 # src/tsmp/api/app.py
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
 import os
@@ -135,7 +135,7 @@ def predictions(
             ph.append(":" + k)
         uid_clause = f" AND unique_id IN ({','.join(ph)})"
 
-    sql = f"""SELECT {select_list} FROM runs r"""
+    sql = f"""SELECT {select_list} FROM runs r""""""
       WHERE (:status IS NULL OR r.status = :status)
       ORDER BY r.created_at DESC
       LIMIT :lim OFFSET :off
@@ -236,7 +236,7 @@ def runs_window(
 
     where_sql = " AND ".join(where)
     sql_total = f"SELECT count(*) FROM runs r WHERE {where_sql}"
-    sql = f"""SELECT {select_list} FROM runs r"""
+    sql = f"""SELECT {select_list} FROM runs r""""""
       WHERE {where_sql}
       ORDER BY r.created_at DESC
       LIMIT :lim OFFSET :off
