@@ -1,5 +1,5 @@
 # src/tsmp/api/app.py
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, HTTPException, Query, status, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
 import os
@@ -56,6 +56,7 @@ class RunRow(BaseModel):
     updated_at: str
     horizon: int | None = None
 
+
 @app.get("/runs/latest", response_model=RunRow)
 def latest_run():
     dialect = engine.url.get_backend_name()
@@ -70,16 +71,21 @@ def latest_run():
 
     n_pred_expr = "(SELECT count(*) FROM predictions p WHERE p.run_id=r.run_id) AS n_predictions"
 
-    sql = f"""SELECT {select_list} FROM runs r"""
+    sql = f"""
+      SELECT r.run_id, r.alias, r.model_name, r.dataset, r.status, r.duration_sec,
+             {created_expr}, {updated_expr}, {horizon_expr}, {n_pred_expr}
+      FROM runs r
       ORDER BY r.created_at DESC
       LIMIT 1
     """
     with engine.begin() as conn:
         row = conn.execute(text(sql)).mappings().first()
-        if not row: raise HTTPException(404, "no runs")
+        if not row:
+            raise HTTPException(404, "no runs")
         d = dict(row)
-        d['mlflow'] = _mlflow_hint(d['run_id'])
+        d["mlflow"] = _mlflow_hint(d["run_id"])
         return d
+
 
 
 
@@ -247,12 +253,11 @@ def runs_window(
         items = [dict(row) for row in conn.execute(text(sql), base).mappings().all()]
         return {"total": total, "count": len(items), "items": items}
 
+
 @app.get("/health")
 def health():
-    # thresholds
     KPI_DURATION_P95_MS = int(os.getenv("KPI_DURATION_P95_MS", "5000"))
     KPI_PREDICTIONS_RATIO = float(os.getenv("KPI_PREDICTIONS_RATIO", "1.0"))
-
     dialect = engine.url.get_backend_name()
 
     if dialect == "postgresql":
@@ -273,7 +278,7 @@ def health():
           FROM latest l CROSS JOIN s CROSS JOIN c
         """
     else:
-        sql_p95 = None  # pythonで計算
+        sql_p95 = None
         sql_ratio = """
           WITH latest AS (
             SELECT run_id, CAST(json_extract(config,'$.config.horizon') AS INT) AS horizon
@@ -291,7 +296,6 @@ def health():
         """
 
     with engine.begin() as conn:
-        # p95
         if dialect == "postgresql":
             p95 = float(conn.execute(text(sql_p95)).scalar_one())
         else:
@@ -304,12 +308,11 @@ def health():
             else:
                 p95 = 0.0
 
-        # ratio
         r = conn.execute(text(sql_ratio)).mappings().first()
         ratio = (float(r["ratio"]) if r and r["ratio"] is not None else None)
         latest_run = (r["run_id"] if r else None)
 
-    ok_p95 = (p95 * 1000.0) <= KPI_DURATION_P95_MS  # sec→ms
+    ok_p95 = (p95 * 1000.0) <= KPI_DURATION_P95_MS
     ok_ratio = (ratio is None) or (ratio >= KPI_PREDICTIONS_RATIO)
     overall = bool(ok_p95 and ok_ratio)
     status_code = status.HTTP_200_OK if overall else status.HTTP_503_SERVICE_UNAVAILABLE
