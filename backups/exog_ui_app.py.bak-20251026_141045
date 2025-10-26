@@ -14,8 +14,8 @@ def get_engine():
     return create_engine(url, pool_pre_ping=True)
 
 @st.cache_data(ttl=300)
-def load_meta(_engine):
-    with _engine.begin() as con:
+def load_meta(engine):
+    with engine.begin() as con:
         meta = pd.read_sql("SELECT * FROM lottery_exog_meta WHERE id=1", con)
         if meta.empty:
             return [], [], []
@@ -26,20 +26,20 @@ def load_meta(_engine):
         return futr, hist, stat
 
 @st.cache_data(ttl=300)
-def list_unique_ids(_engine, table):
+def list_unique_ids(engine, table):
     q = text(f"SELECT DISTINCT unique_id FROM {table} ORDER BY 1")
-    with _engine.begin() as con:
+    with engine.begin() as con:
         return pd.read_sql(q, con)["unique_id"].tolist()
 
 @st.cache_data(ttl=120)
-def date_range_for_uid(_engine, table, uid):
+def date_range_for_uid(engine, table, uid):
     q = text(f"SELECT MIN(ds) AS min_ds, MAX(ds) AS max_ds FROM {table} WHERE unique_id=:u")
-    with _engine.begin() as con:
+    with engine.begin() as con:
         r = pd.read_sql(q, con, params={"u": uid}).iloc[0]
         return (r["min_ds"], r["max_ds"])
 
 @st.cache_data(ttl=120, show_spinner="問い合わせ中...")
-def fetch_df(_engine, table, uid, cols, start, end, limit):
+def fetch_df(engine, table, uid, cols, start, end, limit):
     base = ["unique_id","ds"] + cols
     q = f"SELECT {', '.join(base)} FROM {table} WHERE unique_id=:u"
     params = {"u": uid}
@@ -48,7 +48,7 @@ def fetch_df(_engine, table, uid, cols, start, end, limit):
     q += " ORDER BY ds"
     if limit and limit > 0:
         q += f" LIMIT {int(limit)}"
-    with _engine.begin() as con:
+    with engine.begin() as con:
         df = pd.read_sql(text(q), con, params=params)
     if not df.empty:
         df["ds"] = pd.to_datetime(df["ds"])
