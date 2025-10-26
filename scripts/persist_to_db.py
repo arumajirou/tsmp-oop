@@ -1,110 +1,176 @@
-#!/usr/bin/env python
-import argparse, os, json
+#!/usr/bin/env python3
+"""
+Persist pipeline results to DB using the run_id from outputs/last_run.json.
+
+- PRIMARY RULE: Never generate a new run_id here. Always use --run-json.
+- UPSERT behavior:
+    - PostgreSQL: ON CONFLICT (run_id) DO UPDATE ...
+    - SQLite    : ON CONFLICT(run_id) DO UPDATE ...
+- Timestamps:
+    - PostgreSQL: timezone-aware UTC datetime
+    - SQLite    : 'YYYY-MM-DD HH:MM:SS' (UTC) textual datetime
+- Config column:
+    - Ensure JSON like {"config": {...}} so that $.config.horizon works.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
 from pathlib import Path
-from datetime import datetime
-import yaml
-import pandas as pd
+from datetime import datetime, timezone
+
 from sqlalchemy import create_engine, text
 
-def upsert_run(engine, run_id, alias, model_name, dataset, status, duration_sec, config_dict):
-    payload = {
-        "run_id": run_id,
-        "alias": alias,
-        "model_name": model_name,
-        "dataset": dataset,
-        "status": status,
-        "duration_sec": float(duration_sec) if duration_sec is not None else None,
-        "config": json.dumps(config_dict, ensure_ascii=False),
-    }
-    sql = text("""
-    INSERT INTO runs (run_id, alias, model_name, dataset, status, duration_sec, config, updated_at)
-    VALUES (:run_id, :alias, :model_name, :dataset, :status, :duration_sec, :config, CURRENT_TIMESTAMP)
-    ON CONFLICT (run_id) DO UPDATE SET
-      alias = EXCLUDED.alias,
-      model_name = EXCLUDED.model_name,
-      dataset = EXCLUDED.dataset,
-      status = EXCLUDED.status,
-      duration_sec = EXCLUDED.duration_sec,
-      config = EXCLUDED.config,
-      updated_at = CURRENT_TIMESTAMP
-    """)
-    with engine.begin() as conn:
-        conn.execute(sql, payload)
+try:
+    import yaml  # type: ignore
+except Exception:
+    yaml = None
 
-def upsert_predictions(engine, df: pd.DataFrame, run_id: str):
-    # 期待スキーマ: unique_id(str), ds(datetime-like), y_hat(float)
-    # df に run_id を足して UPSERT
-    records = []
-    for row in df.itertuples(index=False):
-        d = row._asdict() if hasattr(row, "_asdict") else dict(row._asdict())
-        # 柔軟対応
-        uid = d.get("unique_id") or d.get("series") or d.get("id")
-        ds = pd.to_datetime(d.get("ds") or d.get("date") or d.get("timestamp"), utc=True)
-        y = d.get("y_hat") or d.get("yhat") or d.get("forecast") or d.get("value")
-        if uid is None or pd.isna(ds) or y is None:
-            continue
-        records.append({"run_id": run_id, "unique_id": str(uid), "ds": ds.to_pydatetime(), "y_hat": float(y)})
 
-    if not records:
-        print("[persist] predictions: no compatible rows; skip")
-        return
+def _utc_now_pg():
+    # tz-aware for Postgres timestamptz
+    return datetime.now(timezone.utc)
 
-    sql = text("""
-    INSERT INTO predictions (run_id, unique_id, ds, y_hat)
-    VALUES (:run_id, :unique_id, :ds, :y_hat)
-    ON CONFLICT (run_id, unique_id, ds) DO UPDATE SET
-      y_hat = EXCLUDED.y_hat
-    """)
-    with engine.begin() as conn:
-        conn.execute(sql, records)
 
-def main():
-    ap = argparse.ArgumentParser(description="Persist run & optional predictions to Postgres")
-    ap.add_argument("--dsn", default=os.getenv("POSTGRES_DSN", "postgresql:///tsmodeling"))
-    ap.add_argument("--run-json", default="outputs/last_run.json")
-    ap.add_argument("--run-config", default="configs/run_spec.yaml")
-    ap.add_argument("--pred-file", default="outputs/predictions.parquet")
-    args = ap.parse_args()
+def _utc_now_sqlite_str():
+    # textual UTC 'YYYY-MM-DD HH:MM:SS' for SQLite
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-    run_json = Path(args.run_json)
-    run_cfg = Path(args.run_config)
 
-    if not run_json.exists():
-        raise FileNotFoundError(f"{run_json} not found. Execute cli run first.")
-    if not run_cfg.exists():
-        raise FileNotFoundError(f"{run_cfg} not found.")
+def _load_last_run_json(p: Path) -> dict:
+    d = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(d, dict) or not d.get("run_id"):
+        raise ValueError(f"run_id missing in {p}")
+    return d
 
-    result = json.loads(run_json.read_text(encoding="utf-8"))
-    cfg = yaml.safe_load(run_cfg.read_text(encoding="utf-8"))
 
-    run_id = str(result.get("run_id"))
-    duration = result.get("duration_sec")
-    alias = cfg.get("alias", "run")
-    model_name = cfg.get("model_name", "unknown_model")
-    dataset = cfg.get("dataset_path", "unknown_dataset")
-    status = "SUCCEEDED"
+def _load_run_config_yaml(p: Path | None) -> dict | None:
+    if not p:
+        return None
+    if not p.exists():
+        raise FileNotFoundError(str(p))
+    if yaml is None:
+        # optional dependency, but tests usually have it
+        return None
+    y = yaml.safe_load(p.read_text(encoding="utf-8"))
+    if isinstance(y, dict):
+        # Ensure shape has top-level "config" so $.config.horizon works
+        return y if "config" in y else {"config": y}
+    return None
 
-    engine = create_engine(args.dsn, pool_pre_ping=True)
 
-    # runs upsert
-    cfg_subset = {
-        "run": result,
-        "config": {k: cfg.get(k) for k in ["alias","model_name","dataset_path","horizon","val_size","tuner_backend","instance_type","hyperparams"] if k in cfg}
-    }
-    upsert_run(engine, run_id, alias, model_name, dataset, status, duration, cfg_subset)
-    print(f"[persist] runs upserted: run_id={run_id}")
+def persist(dsn: str, run_json: Path, run_config: Path | None):
+    last = _load_last_run_json(run_json)
+    cfg = _load_run_config_yaml(run_config)
 
-    # predictions optional
-    pred_path = Path(args.pred_file)
-    if pred_path.exists():
+    run_id = str(last["run_id"])
+    status = str(last.get("status") or "SUCCEEDED")
+
+    # Optional fields with sane defaults
+    alias = str(last.get("alias") or run_id[:8])
+    model_name = str(last.get("model_name") or "unknown")
+    dataset = str(last.get("dataset") or "unknown")
+    duration_sec = last.get("duration_sec")
+    if duration_sec is not None:
         try:
-            df = pd.read_parquet(pred_path)
-            upsert_predictions(engine, df, run_id)
-            print(f"[persist] predictions upserted from {pred_path}")
-        except Exception as e:
-            print(f"[persist] predictions skipped ({e})")
+            duration_sec = float(duration_sec)
+        except Exception:
+            duration_sec = None
+
+    # config JSON to store in 'runs.config'
+    config_json = last.get("config")
+    if cfg and not config_json:
+        config_json = cfg
+    # If still None, store at least an empty config with "config":{}
+    if config_json is None:
+        config_json = {"config": {}}
+    config_str = json.dumps(config_json, ensure_ascii=False)
+
+    eng = create_engine(dsn, pool_pre_ping=True)
+    dialect = eng.url.get_backend_name()
+
+    if dialect == "postgresql":
+        created_at = updated_at = _utc_now_pg()
+        sql = text(
+            """
+            INSERT INTO runs
+                (run_id, alias, model_name, dataset, status,
+                 duration_sec, created_at, updated_at, config)
+            VALUES
+                (:run_id, :alias, :model_name, :dataset, :status,
+                 :duration_sec, :created_at, :updated_at, CAST(:config AS JSONB))
+            ON CONFLICT (run_id) DO UPDATE SET
+                alias = EXCLUDED.alias,
+                model_name = EXCLUDED.model_name,
+                dataset = EXCLUDED.dataset,
+                status = EXCLUDED.status,
+                duration_sec = EXCLUDED.duration_sec,
+                updated_at = EXCLUDED.updated_at,
+                config = EXCLUDED.config
+            """
+        )
+        params = {
+            "run_id": run_id,
+            "alias": alias,
+            "model_name": model_name,
+            "dataset": dataset,
+            "status": status,
+            "duration_sec": duration_sec,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "config": config_str,
+        }
     else:
-        print("[persist] predictions: file not found; skip")
+        # SQLite: store UTC textual timestamps 'YYYY-MM-DD HH:MM:SS'
+        created_at = updated_at = _utc_now_sqlite_str()
+        sql = text(
+            """
+            INSERT INTO runs
+                (run_id, alias, model_name, dataset, status,
+                 duration_sec, created_at, updated_at, config)
+            VALUES
+                (:run_id, :alias, :model_name, :dataset, :status,
+                 :duration_sec, :created_at, :updated_at, :config)
+            ON CONFLICT(run_id) DO UPDATE SET
+                alias = excluded.alias,
+                model_name = excluded.model_name,
+                dataset = excluded.dataset,
+                status = excluded.status,
+                duration_sec = excluded.duration_sec,
+                updated_at = excluded.updated_at,
+                config = excluded.config
+            """
+        )
+        params = {
+            "run_id": run_id,
+            "alias": alias,
+            "model_name": model_name,
+            "dataset": dataset,
+            "status": status,
+            "duration_sec": duration_sec,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "config": config_str,
+        }
+
+    with eng.begin() as conn:
+        conn.execute(sql, params)
+
+    # Optional: print the persisted run_id to stdout (useful in scripts)
+    print(run_id)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dsn", required=True, help="database DSN (postgresql://... or sqlite:///path.db)")
+    ap.add_argument("--run-json", required=True, type=Path, help="outputs/last_run.json")
+    ap.add_argument("--run-config", required=False, type=Path, help="configs/run_spec.yaml")
+    args = ap.parse_args(argv)
+    persist(args.dsn, args.run_json, args.run_config)
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
