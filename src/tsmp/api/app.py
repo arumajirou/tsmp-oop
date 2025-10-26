@@ -1,27 +1,21 @@
 # src/tsmp/api/app.py
-from fastapi import FastAPI, HTTPException, Query, status, status
+from fastapi import FastAPI, HTTPException, Query, status as http_status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict
-import os
-from sqlalchemy import create_engine, text
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict
+from sqlalchemy import create_engine, text
 from datetime import datetime, timezone
+import os
 
 app = FastAPI(title="tsmp-oop")
-
-app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 DSN = os.getenv("POSTGRES_DSN", "postgresql:///tsmodeling")
 engine = create_engine(DSN, pool_pre_ping=True)
 
+
+# ---------- helpers ----------
 def _mlflow_hint(run_name: str) -> dict | None:
-    """run_name(=DBのrun_id)で MLflow UI の検索URLを組む。
-    前提:
-      - MLFLOW_UI_BASE (例: http://127.0.0.1:5000)
-      - MLFLOW_EXPERIMENT_NAME (既定 'tsmp-oop')
-      - mlflow が import 可能なら experiment_id を解決して実験内検索URLを返す
-      - 無ければ UI ベースだけ返す
-    """
     base = os.getenv("MLFLOW_UI_BASE")
     tracking = os.getenv("MLFLOW_TRACKING_URI")
     exp_name = os.getenv("MLFLOW_EXPERIMENT_NAME", "tsmp-oop")
@@ -40,9 +34,64 @@ def _mlflow_hint(run_name: str) -> dict | None:
             ui_url = base
     except Exception:
         ui_url = base
-
     return {"tracking_uri": tracking, "experiment": exp_name, "ui_url": ui_url}
 
+
+def _parse_utc_ceil(s: str | None):
+    if not s:
+        return None
+    t = s.replace("Z", "").replace("z", "")
+    try:
+        dt = datetime.fromisoformat(t)
+    except Exception:
+        return None
+    if dt.tzinfo:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _list_table_columns(conn, table: str, dialect: str) -> list[str]:
+    if dialect == "sqlite":
+        # PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
+        return [row[1] for row in conn.execute(text(f"PRAGMA table_info({table})")).all()]
+    else:
+        rows = conn.execute(
+            text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = :t"
+            ),
+            {"t": table},
+        ).all()
+        return [r[0] for r in rows]
+
+
+def _resolve_pred_y_expr(conn, dialect: str) -> str:
+    cols = set(_list_table_columns(conn, "predictions", dialect))
+    for cand in ("yhat", "y_pred", "prediction", "y", "value", "y_hat", "yhat_mean", "pred", "forecast"):
+        if cand in cols:
+            return f"p.{cand} AS yhat"
+    return "NULL AS yhat"
+
+
+def _view_exists(conn, view_name: str, dialect: str) -> bool:
+    if dialect == "sqlite":
+        row = conn.execute(
+            text("SELECT name FROM sqlite_master WHERE type='view' AND name=:v"),
+            {"v": view_name},
+        ).first()
+        return bool(row)
+    else:
+        row = conn.execute(
+            text(
+                "SELECT 1 FROM information_schema.views "
+                "WHERE table_schema = current_schema() AND table_name = :v"
+            ),
+            {"v": view_name},
+        ).first()
+        return bool(row)
+
+
+# ---------- models ----------
 class RunRow(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
     mlflow: dict | None = None
@@ -55,8 +104,49 @@ class RunRow(BaseModel):
     created_at: str
     updated_at: str
     horizon: int | None = None
+    n_predictions: int | None = None
 
 
+# ---------- /runs (list) ----------
+@app.get("/runs")
+def list_runs(
+    status_filter: str | None = Query(None, alias="status"),
+    limit: int = 50,
+    offset: int = 0,
+):
+    dialect = engine.url.get_backend_name()
+    if dialect == "postgresql":
+        created_expr = "to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at"
+        updated_expr = "to_char(r.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at"
+        horizon_expr = "COALESCE((r.config #>> '{config,horizon}')::int, NULL) AS horizon"
+    else:
+        created_expr = "strftime('%Y-%m-%dT%H:%M:%SZ', r.created_at) AS created_at"
+        updated_expr = "strftime('%Y-%m-%dT%H:%M:%SZ', r.updated_at) AS updated_at"
+        horizon_expr = "CAST(json_extract(r.config,'$.config.horizon') AS INT) AS horizon"
+
+    n_pred_expr = "(SELECT count(*) FROM predictions p WHERE p.run_id=r.run_id) AS n_predictions"
+
+    where_sql = "(:status IS NULL OR r.status = :status)"
+    params = {"status": status_filter, "lim": limit, "off": offset}
+
+    sql_items = f"""
+      SELECT r.run_id, r.alias, r.model_name, r.dataset, r.status, r.duration_sec,
+             {created_expr}, {updated_expr}, {horizon_expr}, {n_pred_expr}
+      FROM runs r
+      WHERE {where_sql}
+      ORDER BY r.created_at DESC
+      LIMIT :lim OFFSET :off
+    """
+    sql_cnt = f"SELECT count(*) FROM runs r WHERE {where_sql}"
+
+    with engine.begin() as conn:
+        items = [dict(m) for m in conn.execute(text(sql_items), params).mappings().all()]
+        total = int(conn.execute(text(sql_cnt), params).scalar_one())
+
+    return {"total": total, "count": len(items), "items": items}
+
+
+# ---------- /runs/latest ----------
 @app.get("/runs/latest", response_model=RunRow)
 def latest_run():
     dialect = engine.url.get_backend_name()
@@ -87,10 +177,7 @@ def latest_run():
         return d
 
 
-
-
-
-
+# ---------- /predictions ----------
 @app.get("/predictions")
 def predictions(
     run_id: str = Query(...),
@@ -99,161 +186,179 @@ def predictions(
     end: str | None = Query(None, description="ISO8601 UTC (exclusive)"),
     order: str = Query("asc", description="asc|desc"),
     limit: int = 1000,
-    offset: int = 0
+    offset: int = 0,
 ):
-    # 正規化: unique_id は配列/カンマの両方を受ける
+    # unique_id は配列/カンマ両対応
     uids: list[str] = []
     if unique_id:
         for u in unique_id:
             uids.extend([x.strip() for x in str(u).split(",") if x.strip()])
-    uids = list(dict.fromkeys(uids))  # de-dup
+    uids = list(dict.fromkeys(uids))
 
     order_sql = "DESC" if str(order).lower() == "desc" else "ASC"
 
-    # 方言分岐 + ds/閾値の整形
     dialect = engine.url.get_backend_name()
     start_dt = _parse_utc_ceil(start)
     end_dt = _parse_utc_ceil(end)
 
-    where = ["run_id = :rid"]
+    where = ["v.run_id = :rid"]
     params: dict = {"rid": run_id, "lim": limit, "off": offset}
 
     if dialect == "postgresql":
-        ds_expr = """to_char(ds AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS ds"""
-        if start_dt is not None: where.append("ds >= CAST(:start AS timestamptz)"); params["start"] = start_dt
-        if end_dt   is not None: where.append("ds <  CAST(:end   AS timestamptz)"); params["end"]   = end_dt
+        ds_expr = "to_char(v.ds AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS ds"
+        if start_dt is not None:
+            where.append("v.ds >= CAST(:start AS timestamptz)")
+            params["start"] = start_dt
+        if end_dt is not None:
+            where.append("v.ds < CAST(:end AS timestamptz)")
+            params["end"] = end_dt
     else:
-        ds_expr = "strftime('%Y-%m-%dT%H:%M:%SZ', ds) AS ds"
+        ds_expr = "strftime('%Y-%m-%dT%H:%M:%SZ', v.ds) AS ds"
         if start_dt is not None:
             params["start"] = start_dt.strftime("%Y-%m-%d %H:%M:%S")
-            where.append("ds >= :start")
+            where.append("v.ds >= :start")
         if end_dt is not None:
             params["end"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
-            where.append("ds < :end")
+            where.append("v.ds < :end")
 
-    # IN 句の安全展開
-    uid_clause = ""
+    # IN 句（ユニークID）
     if uids:
         ph = []
         for i, u in enumerate(uids):
             k = f"u{i}"
             params[k] = u
             ph.append(":" + k)
-        uid_clause = f" AND unique_id IN ({','.join(ph)})"
+        where.append(f"v.unique_id IN ({','.join(ph)})")
 
-    sql = f"""SELECT {select_list} FROM runs r""""""
-      WHERE (:status IS NULL OR r.status = :status)
-      ORDER BY r.created_at DESC
-      LIMIT :lim OFFSET :off
-    """
-    sql_cnt = "SELECT count(*) FROM runs r WHERE (:status IS NULL OR r.status = :status)"
+    where_sql = " AND ".join(where)
+
     with engine.begin() as conn:
-        items = [dict(m) for m in conn.execute(text(sql_items), {"status": status, "lim": limit, "off": offset}).mappings().all()]
-        total = int(conn.execute(text(sql_cnt), {"status": status}).scalar_one())
-    return {"total": total, "count": len(items), "items": items}
+        use_view = _view_exists(conn, "predictions_view", dialect)
+        if use_view:
+            sql = f"""
+              SELECT v.run_id, v.unique_id, {ds_expr}, v.yhat
+              FROM predictions_view v
+              WHERE {where_sql}
+              ORDER BY v.ds {order_sql}
+              LIMIT :lim OFFSET :off
+            """
+        else:
+            # フォールバック：テーブルから動的に yhat を解決
+            y_expr = _resolve_pred_y_expr(conn, dialect).replace("p.", "v.")
+            sql = f"""
+              SELECT v.run_id, v.unique_id, {ds_expr}, {y_expr}
+              FROM predictions v
+              WHERE {where_sql}
+              ORDER BY v.ds {order_sql}
+              LIMIT :lim OFFSET :off
+            """
+        items = [dict(m) for m in conn.execute(text(sql), params).mappings().all()]
 
-def _parse_utc_ceil(s: str|None):
-    if not s: return None
-    t = s.replace("Z","").replace("z","")
-    try:
-        dt = datetime.fromisoformat(t)
-    except Exception:
-        return None
-    if dt.tzinfo:
-        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-    return dt
+    return {"total": None, "count": len(items), "items": items}
 
 
-
-
+# ---------- /runs/window ----------
 @app.get("/runs/window")
 def runs_window(
     start: str | None = Query(None, description="ISO8601 UTC, e.g. 2025-01-01T00:00:00Z"),
     end: str | None = Query(None, description="ISO8601 UTC (exclusive)"),
-    status: str | None = Query(None),
+    status_filter: str | None = Query(None, alias="status"),
     model_name: str | None = Query(None),
     alias: str | None = Query(None),
-    fields: str | None = Query(None, description="comma-separated: run_id,alias,model_name,dataset,status,duration_sec,created_at,updated_at,horizon,n_predictions"),
+    fields: str | None = Query(
+        None,
+        description="comma-separated: run_id,alias,model_name,dataset,status,duration_sec,created_at,updated_at,horizon,n_predictions",
+    ),
     limit: int = 50,
-    offset: int = 0
+    offset: int = 0,
 ):
     dialect = engine.url.get_backend_name()
-    # 方言別の式
-    if dialect == 'postgresql':
+    if dialect == "postgresql":
         created_expr = "to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at"
         updated_expr = "to_char(r.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at"
+        horizon_expr = "COALESCE((r.config #>> '{config,horizon}')::int, NULL) AS horizon"
     else:
-        # sqlite: TEXT型DATETIME想定
         created_expr = "strftime('%Y-%m-%dT%H:%M:%SZ', r.created_at) AS created_at"
         updated_expr = "strftime('%Y-%m-%dT%H:%M:%SZ', r.updated_at) AS updated_at"
-    horizon_expr = "COALESCE((r.config #>> '{config,horizon}')::int, NULL) AS horizon" if dialect=='postgresql' else "CAST(json_extract(r.config,'$.config.horizon') AS INT) AS horizon"
+        horizon_expr = "CAST(json_extract(r.config,'$.config.horizon') AS INT) AS horizon"
+
     n_pred_expr = "(SELECT count(*) FROM predictions p WHERE p.run_id=r.run_id) AS n_predictions"
-    _RUNS_WINDOW_COLSQL = {
-        'run_id': 'r.run_id',
-        'alias': 'r.alias',
-        'model_name': 'r.model_name',
-        'dataset': 'r.dataset',
-        'status': 'r.status',
-        'duration_sec': 'r.duration_sec',
-        'created_at': created_expr,
-        'updated_at': updated_expr,
-        'horizon': horizon_expr,
-        'n_predictions': n_pred_expr,
+
+    colsql = {
+        "run_id": "r.run_id",
+        "alias": "r.alias",
+        "model_name": "r.model_name",
+        "dataset": "r.dataset",
+        "status": "r.status",
+        "duration_sec": "r.duration_sec",
+        "created_at": created_expr,
+        "updated_at": updated_expr,
+        "horizon": horizon_expr,
+        "n_predictions": n_pred_expr,
     }
-    allowed = list(_RUNS_WINDOW_COLSQL.keys())
-    # fields パース（未指定なら全列）。常に run_id は含める。
+    allowed = list(colsql.keys())
+
     if fields:
-        req = [x.strip() for x in fields.split(',') if x.strip() in allowed]
-        if 'run_id' not in req: req = ['run_id'] + req
-        if not req: req = allowed
+        req = [x.strip() for x in fields.split(",") if x.strip() in allowed]
+        if "run_id" not in req:
+            req = ["run_id"] + req
+        if not req:
+            req = allowed
     else:
         req = allowed
-    select_list = ', '.join(_RUNS_WINDOW_COLSQL[k] + f" AS {k}" if ' AS ' not in _RUNS_WINDOW_COLSQL[k] else _RUNS_WINDOW_COLSQL[k] for k in req)
-    # ↑ horizon/created_at/updated_at/n_predictions は式に AS が含まれるのでそのまま
+
+    def _alias_if_needed(expr: str, name: str) -> str:
+        return expr if " AS " in expr.upper() else f"{expr} AS {name}"
+
+    select_list = ", ".join(_alias_if_needed(colsql[k], k) for k in req)
 
     start_dt = _parse_utc_ceil(start)
     end_dt = _parse_utc_ceil(end)
 
     params: dict = {"lim": limit, "off": offset}
     where = ["1=1"]
-    if status:
-        where.append("r.status = :status"); params["status"] = status
+    if status_filter:
+        where.append("r.status = :status")
+        params["status"] = status_filter
     if model_name:
-        where.append("r.model_name = :model_name"); params["model_name"] = model_name
+        where.append("r.model_name = :model_name")
+        params["model_name"] = model_name
     if alias:
-        where.append("r.alias = :alias"); params["alias"] = alias
+        where.append("r.alias = :alias")
+        params["alias"] = alias
 
     if dialect == "postgresql":
-        if start_dt is not None: where.append("r.created_at >= CAST(:start AS timestamptz)")
-        if end_dt   is not None: where.append("r.created_at <  CAST(:end   AS timestamptz)")
-        ts_cols = """to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
-                     to_char(r.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at"""
-        horizon_sql = "COALESCE((r.config #>> '{config,horizon}')::int, NULL) AS horizon"
-        start_param, end_param = start_dt, end_dt
-    else:
-        # SQLite: 文字列比較 & ISO8601Z 生成
         if start_dt is not None:
-            params["start"] = start_dt.strftime("%Y-%m-%d %H:%M:%S"); where.append("r.created_at >= :start")
+            where.append("r.created_at >= CAST(:start AS timestamptz)")
+            params["start"] = start_dt
         if end_dt is not None:
-            params["end"] = end_dt.strftime("%Y-%m-%d %H:%M:%S");   where.append("r.created_at <  :end")
-        ts_cols = "replace(r.created_at,' ','T')||'Z' AS created_at, replace(r.updated_at,' ','T')||'Z' AS updated_at"
-        horizon_sql = "NULL AS horizon"
-        start_param, end_param = params.get("start"), params.get("end")
+            where.append("r.created_at < CAST(:end AS timestamptz)")
+            params["end"] = end_dt
+    else:
+        if start_dt is not None:
+            params["start"] = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+            where.append("r.created_at >= :start")
+        if end_dt is not None:
+            params["end"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+            where.append("r.created_at < :end")
 
     where_sql = " AND ".join(where)
     sql_total = f"SELECT count(*) FROM runs r WHERE {where_sql}"
-    sql = f"""SELECT {select_list} FROM runs r""""""
+    sql = f"""
+      SELECT {select_list}
+      FROM runs r
       WHERE {where_sql}
       ORDER BY r.created_at DESC
       LIMIT :lim OFFSET :off
     """
+
     with engine.begin() as conn:
-        base = {**params, "start": start_param, "end": end_param}
-        total = int(conn.execute(text(sql_total), base).scalar_one())
-        items = [dict(row) for row in conn.execute(text(sql), base).mappings().all()]
+        total = int(conn.execute(text(sql_total), params).scalar_one())
+        items = [dict(row) for row in conn.execute(text(sql), params).mappings().all()]
         return {"total": total, "count": len(items), "items": items}
 
 
+# ---------- /health ----------
 @app.get("/health")
 def health():
     KPI_DURATION_P95_MS = int(os.getenv("KPI_DURATION_P95_MS", "5000"))
@@ -302,9 +407,11 @@ def health():
             rows = conn.execute(text("SELECT duration_sec FROM runs WHERE duration_sec IS NOT NULL ORDER BY duration_sec")).all()
             vals = [float(x[0]) for x in rows]
             if vals:
-                k = (len(vals)-1)*0.95
-                f = int(k); c = min(f+1, len(vals)-1)
-                p95 = vals[f] if c == f else (vals[f]*(c-k) + vals[c]*(k-f))
+                # 線形補間
+                k = (len(vals) - 1) * 0.95
+                f = int(k)
+                c = min(f + 1, len(vals) - 1)
+                p95 = vals[f] if c == f else (vals[f] * (c - k) + vals[c] * (k - f))
             else:
                 p95 = 0.0
 
@@ -315,18 +422,11 @@ def health():
     ok_p95 = (p95 * 1000.0) <= KPI_DURATION_P95_MS
     ok_ratio = (ratio is None) or (ratio >= KPI_PREDICTIONS_RATIO)
     overall = bool(ok_p95 and ok_ratio)
-    status_code = status.HTTP_200_OK if overall else status.HTTP_503_SERVICE_UNAVAILABLE
+    status_code = http_status.HTTP_200_OK if overall else http_status.HTTP_503_SERVICE_UNAVAILABLE
 
     payload = {
         "ok": overall,
-        "checks": {
-            "duration_p95_sec": p95,
-            "predictions_ratio": ratio,
-            "latest_run_id": latest_run
-        },
-        "thresholds": {
-            "duration_p95_ms": KPI_DURATION_P95_MS,
-            "predictions_ratio": KPI_PREDICTIONS_RATIO
-        }
+        "checks": {"duration_p95_sec": p95, "predictions_ratio": ratio, "latest_run_id": latest_run},
+        "thresholds": {"duration_p95_ms": KPI_DURATION_P95_MS, "predictions_ratio": KPI_PREDICTIONS_RATIO},
     }
     return JSONResponse(content=payload, status_code=status_code)
