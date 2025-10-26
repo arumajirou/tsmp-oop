@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+PY="${PY:-/home/az/miniconda3/envs/nc/bin/python}"
+exec "$PY" scripts/inspect_lottery.py "$@"
