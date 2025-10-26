@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Iterable, Optional, List, Dict, Tuple
@@ -39,7 +40,7 @@ def _utc_now_pg():
 def _utc_now_sqlite_str():
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-def _to_utc_aware(series: pd.Series) -> pd.Series:
+def _to_utc(series) -> pd.Series:
     s = pd.to_datetime(series, utc=True, errors="coerce")
     return s.dt.tz_convert("UTC")
 
@@ -87,7 +88,7 @@ def _read_predictions_frame(path: Path) -> pd.DataFrame:
         return pd.read_csv(path)
 
 
-# ---------- column detection (robust) ----------
+# ---------- column detection on dataframe ----------
 
 def _detect_col(cols: List[str], candidates: List[str]) -> Optional[str]:
     lower = {c.lower(): c for c in cols}
@@ -121,10 +122,7 @@ def _pick_value_col(df: pd.DataFrame) -> str:
     val = _detect_col(df.columns.tolist(), _VAL_CANDIDATES)
     if val:
         return val
-    exclude = {
-        "y", "y_true", "actual", "y_lo", "y_hi",
-        "y_lower", "y_upper", "lower", "upper", "lo", "hi"
-    }
+    exclude = {"y", "y_true", "actual", "y_lo", "y_hi", "y_lower", "y_upper", "lower", "upper", "lo", "hi"}
     numeric = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     numeric = [c for c in numeric if c.lower() not in exclude]
     if numeric:
@@ -135,66 +133,96 @@ def _pick_value_col(df: pd.DataFrame) -> str:
 
 # ---------- choose destination value column existing in table ----------
 
+_NUMERIC_HINTS_SQLITE = ("INT", "REAL", "FLOA", "DOUB", "NUM")  # partials for affinity
+_EXCLUDE_COLS = {"run_id", "unique_id", "ds", "created_at", "updated_at", "id"}
+
 def _pick_dst_value_col(engine: Engine) -> str:
+    """
+    Inspect the *table* and pick the real value column.
+
+    Priority:
+      1) any numeric-typed column except excluded keys
+      2) first present among (yhat, yhat_mean, pred, forecast) (case-insensitive)
+      3) any remaining non-excluded column
+    """
     dialect = engine.url.get_backend_name()
+    have: List[Tuple[str, Optional[str]]] = []
+
     with engine.begin() as conn:
         if dialect == "sqlite":
             rows = conn.execute(text("PRAGMA table_info(predictions)")).mappings().all()
-            have = {r["name"] for r in rows}
+            for r in rows:
+                have.append((str(r["name"]), (str(r["type"]) if r["type"] is not None else None)))
         else:
             q = """
-            SELECT column_name
+            SELECT column_name, data_type
               FROM information_schema.columns
              WHERE table_name = 'predictions'
             """
-            rows = conn.execute(text(q)).all()
-            have = {r[0] for r in rows}
-    
-    # Try common prediction column names
-    candidates = [
-        "yhat", "yhat_mean", "pred", "forecast", 
-        "value", "predicted_value", "prediction", "y_pred"
-    ]
-    for c in candidates:
-        if c in have:
-            return c
-    
-    # If none found, raise an error instead of defaulting
-    raise ValueError(
-        f"predictions table has no recognized value column. "
-        f"Available columns: {sorted(have)}. "
-        f"Expected one of: {candidates}"
-    )
+            for name, data_type in conn.execute(text(q)).all():
+                have.append((str(name), (str(data_type) if data_type is not None else None)))
+
+    names = [n for n, _ in have]
+
+    # 1) numeric-typed first
+    for n, t in have:
+        if n in _EXCLUDE_COLS:
+            continue
+        if t:
+            t_up = t.upper()
+            if any(k in t_up for k in _NUMERIC_HINTS_SQLITE) or t_up in {
+                "DOUBLE PRECISION", "REAL", "NUMERIC", "INTEGER", "BIGINT", "SMALLINT", "DECIMAL", "FLOAT"
+            }:
+                return n
+
+    # 2) canonical candidates case-insensitive
+    lower_map = {n.lower(): n for n in names}
+    for cand in ["yhat", "yhat_mean", "pred", "forecast"]:
+        if cand in lower_map:
+            return lower_map[cand]
+
+    # 3) last-resort: first non-excluded column
+    for n in names:
+        if n not in _EXCLUDE_COLS:
+            return n
+
+    # desperate fallback (should not happen if table exists)
+    return "yhat"
 
 
-# ---------- row builders (fixed placeholder names) ----------
+# ---------- row builders ----------
 
-def _rows_pg(run_id: str, df: pd.DataFrame) -> Iterable[Dict[str, object]]:
+def _rows_pg_dict(run_id: str, df: pd.DataFrame) -> Iterable[Dict[str, object]]:
     uid_col = _pick_uid_col(df)
     ts = _pick_ts_series(df)
     val_col = _pick_value_col(df)
 
     uid = df[uid_col].astype(str)
-    ts_utc = _to_utc_aware(ts)
+    ts_utc = _to_utc(ts)
     val = pd.to_numeric(df[val_col], errors="coerce")
 
     mask = (~uid.isna()) & (~ts_utc.isna()) & (~val.isna())
-    for u, d, y in zip(uid[mask], ts_utc[mask].dt.to_pydatetime(), val[mask]):
-        yield {"run_id": run_id, "unique_id": u, "ds": d, "val": float(y)}
+    idx = df.index[mask]
+    ds_py = ts_utc.loc[idx].dt.to_pydatetime()
 
-def _rows_sqlite(run_id: str, df: pd.DataFrame) -> Iterable[Tuple[object, ...]]:
+    for i in idx:
+        yield {"run_id": run_id, "unique_id": str(uid.loc[i]), "ds": ds_py.loc[i], "val": float(val.loc[i])}
+
+def _rows_sqlite_tuple4(run_id: str, df: pd.DataFrame) -> Iterable[Tuple[object, ...]]:
     uid_col = _pick_uid_col(df)
     ts = _pick_ts_series(df)
     val_col = _pick_value_col(df)
 
     uid = df[uid_col].astype(str)
-    ts_utc = _to_utc_aware(ts)
+    ts_utc = _to_utc(ts)
     ts_txt = _to_sqlite_utc_text(ts_utc)
     val = pd.to_numeric(df[val_col], errors="coerce")
 
     mask = (~uid.isna()) & (~ts_txt.isna()) & (~val.isna())
-    for u, d, y in zip(uid[mask], ts_txt[mask], val[mask]):
-        yield (run_id, u, str(d), float(y))
+    idx = df.index[mask]
+
+    for i in idx:
+        yield (run_id, str(uid.loc[i]), str(ts_txt.loc[i]), float(val.loc[i]))
 
 
 # ---------- main persist ----------
@@ -289,6 +317,8 @@ def persist(
             "config": config_str,
         }
 
+    inserted_count = 0
+
     with eng.begin() as conn:
         conn.execute(sql_runs, runs_params)
 
@@ -298,7 +328,8 @@ def persist(
                 raise FileNotFoundError(str(pred_file))
 
             df = _read_predictions_frame(pred_file)
-            # Always clear existing rows for this run_id
+
+            # 既存行を run_id 単位で削除
             conn.execute(text("DELETE FROM predictions WHERE run_id = :rid"), {"rid": run_id})
 
             if df is None or df.empty:
@@ -308,26 +339,28 @@ def persist(
             dst_val_col = _pick_dst_value_col(eng)
 
             if dialect == "postgresql":
-                rows = list(_rows_pg(run_id, df))
+                rows = list(_rows_pg_dict(run_id, df))
                 if rows:
-                    # named binds with a fixed ':val' key (robust)
                     conn.execute(
-                        text(f"""
-                            INSERT INTO predictions (run_id, unique_id, ds, {dst_val_col})
-                            VALUES (:run_id, :unique_id, :ds, :val)
-                        """),
+                        text(f"INSERT INTO predictions (run_id, unique_id, ds, {dst_val_col}) "
+                             f"VALUES (:run_id, :unique_id, :ds, :val)"),
                         rows,
                     )
+                    inserted_count = len(rows)
             else:
-                rows = list(_rows_sqlite(run_id, df))
+                rows = list(_rows_sqlite_tuple4(run_id, df))
+                if rows and not all(len(r) == 4 for r in rows):
+                    raise RuntimeError(f"internal: expected 4-tuple per row, got lens="
+                                       f"{set(len(r) for r in rows)}; example={rows[:3]}")
                 if rows:
-                    # use positional qmarks to avoid named-binding edge cases on SQLite
                     conn.exec_driver_sql(
                         f"INSERT INTO predictions (run_id, unique_id, ds, {dst_val_col}) VALUES (?,?,?,?)",
                         rows,
                     )
+                    inserted_count = len(rows)
 
-    # Useful in pipelines/tests
+    if os.environ.get("PERSIST_DEBUG"):
+        print(f"[persist] inserted predictions: {inserted_count}")
     print(run_id)
 
 
