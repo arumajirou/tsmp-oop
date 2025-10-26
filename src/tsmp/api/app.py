@@ -58,14 +58,20 @@ class RunRow(BaseModel):
 
 @app.get("/runs/latest", response_model=RunRow)
 def latest_run():
-    sql = """
-      SELECT r.run_id, r.alias, r.model_name, r.dataset, r.status, r.duration_sec,
-             to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
-             to_char(r.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at,
-             COALESCE((r.config #>> '{config,horizon}')::int, NULL) AS horizon,
-             (SELECT count(*) FROM predictions p WHERE p.run_id=r.run_id) AS n_predictions
-      FROM runs r
-      ORDER BY created_at DESC
+    dialect = engine.url.get_backend_name()
+    if dialect == "postgresql":
+        created_expr = "to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at"
+        updated_expr = "to_char(r.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at"
+        horizon_expr = "COALESCE((r.config #>> '{config,horizon}')::int, NULL) AS horizon"
+    else:
+        created_expr = "strftime('%Y-%m-%dT%H:%M:%SZ', r.created_at) AS created_at"
+        updated_expr = "strftime('%Y-%m-%dT%H:%M:%SZ', r.updated_at) AS updated_at"
+        horizon_expr = "CAST(json_extract(r.config,'$.config.horizon') AS INT) AS horizon"
+
+    n_pred_expr = "(SELECT count(*) FROM predictions p WHERE p.run_id=r.run_id) AS n_predictions"
+
+    sql = f"""SELECT {select_list} FROM runs r"""
+      ORDER BY r.created_at DESC
       LIMIT 1
     """
     with engine.begin() as conn:
@@ -129,136 +135,12 @@ def predictions(
             ph.append(":" + k)
         uid_clause = f" AND unique_id IN ({','.join(ph)})"
 
-    sql = f"""
-      SELECT unique_id, {ds_expr}, y_hat
-      FROM predictions
-      WHERE {' AND '.join(where)}{uid_clause}
-      ORDER BY ds {order_sql}
-      LIMIT :lim OFFSET :off
-    """
-    sql_total = f"SELECT count(*) FROM predictions WHERE {' AND '.join(where)}{uid_clause}"
-
-    with engine.begin() as conn:
-        items = [dict(r) for r in conn.execute(text(sql), params).mappings().all()]
-        total = int(conn.execute(text(sql_total), params).scalar_one())
-
-    return {"run_id": run_id, "count": len(items), "total": total, "items": items}
-
-@app.get("/health")
-def health():
-    # 1) duration p95
-    sql_p95 = "SELECT COALESCE(percentile_disc(0.95) WITHIN GROUP (ORDER BY duration_sec), 0) AS p95 FROM runs"
-    # 2) 最新 run の予測充足率（= 実際件数 / (ユニーク系列数 * horizon)）
-    sql_ratio = """
-      WITH latest AS (
-        SELECT run_id, (config #>> '{config,horizon}')::int AS horizon
-        FROM runs ORDER BY created_at DESC LIMIT 1
-      ),
-      s AS (SELECT count(DISTINCT p.unique_id) AS n_series
-            FROM predictions p JOIN latest l ON p.run_id = l.run_id),
-      c AS (SELECT count(*) AS n_pred
-            FROM predictions p JOIN latest l ON p.run_id = l.run_id)
-      SELECT l.run_id, l.horizon, s.n_series, c.n_pred,
-             CASE WHEN s.n_series>0 AND l.horizon>0
-                  THEN c.n_pred::float / (s.n_series * l.horizon)
-                  ELSE NULL END AS ratio
-      FROM latest l CROSS JOIN s CROSS JOIN c
-    """
-    with engine.begin() as conn:
-        p95 = float(conn.execute(text(sql_p95)).scalar_one())
-        r = conn.execute(text(sql_ratio)).mappings().first()
-        ratio = (float(r["ratio"]) if r and r["ratio"] is not None else None)
-        latest_run = (r["run_id"] if r else None)
-
-    ok_p95 = (p95 * 1000.0) <= KPI_DURATION_P95_MS  # sec→ms
-    ok_ratio = (ratio is None) or (ratio >= KPI_PREDICTIONS_RATIO)
-
-    overall = bool(ok_p95 and ok_ratio)
-    status_code = status.HTTP_200_OK if overall else status.HTTP_503_SERVICE_UNAVAILABLE
-    payload = {
-        "ok": overall,
-        "checks": {
-            "duration_p95_sec": p95,
-            "threshold_ms": KPI_DURATION_P95_MS,
-            "predictions_ratio": ratio,
-            "ratio_threshold": KPI_PREDICTIONS_RATIO,
-            "latest_run_id": latest_run
-        }
-    }
-    payload["thresholds"] = {"duration_p95_ms": KPI_DURATION_P95_MS, "predictions_ratio": KPI_PREDICTIONS_RATIO}
-    return JSONResponse(content=payload, status_code=status_code)
-
-
-from fastapi import status
-import math
-
-KPI_DURATION_P95_MS = int(os.getenv("KPI_DURATION_P95_MS", "5000"))
-KPI_PREDICTIONS_RATIO = float(os.getenv("KPI_PREDICTIONS_RATIO", "1.0"))
-
-@app.get("/health")
-def health():
-    # 1) duration p95
-    sql_p95 = "SELECT COALESCE(percentile_disc(0.95) WITHIN GROUP (ORDER BY duration_sec), 0) AS p95 FROM runs"
-    # 2) 最新 run の予測充足率（= 実際件数 / (ユニーク系列数 * horizon)）
-    sql_ratio = """
-      WITH latest AS (
-        SELECT run_id, (config #>> '{config,horizon}')::int AS horizon
-        FROM runs ORDER BY created_at DESC LIMIT 1
-      ),
-      s AS (SELECT count(DISTINCT p.unique_id) AS n_series
-            FROM predictions p JOIN latest l ON p.run_id = l.run_id),
-      c AS (SELECT count(*) AS n_pred
-            FROM predictions p JOIN latest l ON p.run_id = l.run_id)
-      SELECT l.run_id, l.horizon, s.n_series, c.n_pred,
-             CASE WHEN s.n_series>0 AND l.horizon>0
-                  THEN c.n_pred::float / (s.n_series * l.horizon)
-                  ELSE NULL END AS ratio
-      FROM latest l CROSS JOIN s CROSS JOIN c
-    """
-    with engine.begin() as conn:
-        p95 = float(conn.execute(text(sql_p95)).scalar_one())
-        r = conn.execute(text(sql_ratio)).mappings().first()
-        ratio = (float(r["ratio"]) if r and r["ratio"] is not None else None)
-        latest_run = (r["run_id"] if r else None)
-
-    ok_p95 = (p95 * 1000.0) <= KPI_DURATION_P95_MS  # sec→ms
-    ok_ratio = (ratio is None) or (ratio >= KPI_PREDICTIONS_RATIO)
-
-    overall = bool(ok_p95 and ok_ratio)
-    status_code = status.HTTP_200_OK if overall else status.HTTP_503_SERVICE_UNAVAILABLE
-    payload = {
-        "ok": overall,
-        "checks": {
-            "duration_p95_sec": p95,
-            "threshold_ms": KPI_DURATION_P95_MS,
-            "predictions_ratio": ratio,
-            "ratio_threshold": KPI_PREDICTIONS_RATIO,
-            "latest_run_id": latest_run
-        }
-    }
-    payload["thresholds"] = {"duration_p95_ms": KPI_DURATION_P95_MS, "predictions_ratio": KPI_PREDICTIONS_RATIO}
-    return JSONResponse(content=payload, status_code=status_code)
-
-
-@app.get("/runs")
-def list_runs(limit: int = Query(100, ge=1, le=1000),
-              offset: int = Query(0, ge=0),
-              status: str | None = Query(None)):
-    sql_items = """
-      SELECT r.run_id, r.alias, r.model_name, r.dataset, r.status, r.duration_sec,
-             to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
-             to_char(r.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at,
-             COALESCE((r.config #>> '{config,horizon}')::int, NULL) AS horizon,
-             (SELECT count(*) FROM predictions p WHERE p.run_id=r.run_id) AS n_predictions
-      FROM runs r
+    sql = f"""SELECT {select_list} FROM runs r"""
       WHERE (:status IS NULL OR r.status = :status)
       ORDER BY r.created_at DESC
       LIMIT :lim OFFSET :off
     """
-    sql_cnt = """
-      SELECT count(*) FROM runs r
-      WHERE (:status IS NULL OR r.status = :status)
-    """
+    sql_cnt = "SELECT count(*) FROM runs r WHERE (:status IS NULL OR r.status = :status)"
     with engine.begin() as conn:
         items = [dict(m) for m in conn.execute(text(sql_items), {"status": status, "lim": limit, "off": offset}).mappings().all()]
         total = int(conn.execute(text(sql_cnt), {"status": status}).scalar_one())
@@ -354,12 +236,7 @@ def runs_window(
 
     where_sql = " AND ".join(where)
     sql_total = f"SELECT count(*) FROM runs r WHERE {where_sql}"
-    sql = f"""
-      SELECT r.run_id, r.alias, r.model_name, r.dataset, r.status, r.duration_sec,
-             {ts_cols},
-             {horizon_sql},
-             (SELECT count(*) FROM predictions p WHERE p.run_id = r.run_id) AS n_predictions
-      FROM runs r
+    sql = f"""SELECT {select_list} FROM runs r"""
       WHERE {where_sql}
       ORDER BY r.created_at DESC
       LIMIT :lim OFFSET :off
@@ -369,3 +246,84 @@ def runs_window(
         total = int(conn.execute(text(sql_total), base).scalar_one())
         items = [dict(row) for row in conn.execute(text(sql), base).mappings().all()]
         return {"total": total, "count": len(items), "items": items}
+
+@app.get("/health")
+def health():
+    # thresholds
+    KPI_DURATION_P95_MS = int(os.getenv("KPI_DURATION_P95_MS", "5000"))
+    KPI_PREDICTIONS_RATIO = float(os.getenv("KPI_PREDICTIONS_RATIO", "1.0"))
+
+    dialect = engine.url.get_backend_name()
+
+    if dialect == "postgresql":
+        sql_p95 = "SELECT COALESCE(percentile_disc(0.95) WITHIN GROUP (ORDER BY duration_sec), 0) AS p95 FROM runs"
+        sql_ratio = """
+          WITH latest AS (
+            SELECT run_id, (config #>> '{config,horizon}')::int AS horizon
+            FROM runs ORDER BY created_at DESC LIMIT 1
+          ),
+          s AS (SELECT count(DISTINCT p.unique_id) AS n_series
+                FROM predictions p JOIN latest l ON p.run_id = l.run_id),
+          c AS (SELECT count(*) AS n_pred
+                FROM predictions p JOIN latest l ON p.run_id = l.run_id)
+          SELECT l.run_id, l.horizon, s.n_series, c.n_pred,
+                 CASE WHEN s.n_series>0 AND l.horizon>0
+                      THEN c.n_pred::float / (s.n_series * l.horizon)
+                      ELSE NULL END AS ratio
+          FROM latest l CROSS JOIN s CROSS JOIN c
+        """
+    else:
+        sql_p95 = None  # pythonで計算
+        sql_ratio = """
+          WITH latest AS (
+            SELECT run_id, CAST(json_extract(config,'$.config.horizon') AS INT) AS horizon
+            FROM runs ORDER BY created_at DESC LIMIT 1
+          ),
+          s AS (SELECT count(DISTINCT p.unique_id) AS n_series
+                FROM predictions p JOIN latest l ON p.run_id = l.run_id),
+          c AS (SELECT count(*) AS n_pred
+                FROM predictions p JOIN latest l ON p.run_id = l.run_id)
+          SELECT l.run_id, l.horizon, s.n_series, c.n_pred,
+                 CASE WHEN s.n_series>0 AND l.horizon>0
+                      THEN CAST(c.n_pred AS FLOAT) / (s.n_series * l.horizon)
+                      ELSE NULL END AS ratio
+          FROM latest l CROSS JOIN s CROSS JOIN c
+        """
+
+    with engine.begin() as conn:
+        # p95
+        if dialect == "postgresql":
+            p95 = float(conn.execute(text(sql_p95)).scalar_one())
+        else:
+            rows = conn.execute(text("SELECT duration_sec FROM runs WHERE duration_sec IS NOT NULL ORDER BY duration_sec")).all()
+            vals = [float(x[0]) for x in rows]
+            if vals:
+                k = (len(vals)-1)*0.95
+                f = int(k); c = min(f+1, len(vals)-1)
+                p95 = vals[f] if c == f else (vals[f]*(c-k) + vals[c]*(k-f))
+            else:
+                p95 = 0.0
+
+        # ratio
+        r = conn.execute(text(sql_ratio)).mappings().first()
+        ratio = (float(r["ratio"]) if r and r["ratio"] is not None else None)
+        latest_run = (r["run_id"] if r else None)
+
+    ok_p95 = (p95 * 1000.0) <= KPI_DURATION_P95_MS  # sec→ms
+    ok_ratio = (ratio is None) or (ratio >= KPI_PREDICTIONS_RATIO)
+    overall = bool(ok_p95 and ok_ratio)
+    status_code = status.HTTP_200_OK if overall else status.HTTP_503_SERVICE_UNAVAILABLE
+
+    payload = {
+        "ok": overall,
+        "checks": {
+            "duration_p95_sec": p95,
+            "predictions_ratio": ratio,
+            "latest_run_id": latest_run
+        },
+        "thresholds": {
+            "duration_p95_ms": KPI_DURATION_P95_MS,
+            "predictions_ratio": KPI_PREDICTIONS_RATIO
+        }
+    }
+    return JSONResponse(content=payload, status_code=status_code)
