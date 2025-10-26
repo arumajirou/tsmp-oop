@@ -145,7 +145,7 @@ def upsert_meta(engine, meta_table, idx_table, futr_cols, hist_cols, stat_cols):
     with engine.begin() as con:
         con.execute(text(f"DELETE FROM {meta_table} WHERE id=1"))
         con.execute(
-            text(f"INSERT INTO {meta_table}(id, futr_exog_list, hist_exog_list, stat_exog_list) VALUES (1, CAST(:f AS text[]), CAST(:h AS text[]), CAST(:s AS text[])"),
+            text(f"INSERT INTO {meta_table}(id, futr_exog_list, hist_exog_list, stat_exog_list) VALUES (1, :f::text[], :h::text[], :s::text[]"),
             {"f": futr_cols, "h": hist_cols, "s": stat_cols}
         )
         con.execute(text(f"DELETE FROM {idx_table}"))
