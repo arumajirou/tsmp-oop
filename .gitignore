@@ -19,3 +19,7 @@ tsapi.db
 outputs/
 outputs/*.parquet
 outputs/*.json
+# secrets & local overrides
+ops/systemd/lottery-load.env
+.env
+*.bak

@@ -1,0 +1,27 @@
+# /etc/systemd/system/lottery-load.service
+[Unit]
+Description=Load lottery datasets into PostgreSQL
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=az
+Group=az
+WorkingDirectory=/mnt/e/env/ts/nf/tsmp-oop
+EnvironmentFile=/etc/lottery-load.env
+ExecStart=/usr/bin/env bash -lc 'set -euo pipefail; PY=/home/az/miniconda3/envs/nc/bin/python; for g in mini loto6 loto7 bingo5 numbers3 numbers4; do "$PY" scripts/load_lottery.py --db "$DATABASE_URL" --game "$g"; done; psql "$DATABASE_URL" -c "ANALYZE lottery_draws;"'
+StandardOutput=journal
+StandardError=journal
+# --- 軽いハードニング ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/mnt/e/env/ts/nf/tsmp-oop
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+CapabilityBoundingSet=
+SystemCallFilter=@system-service

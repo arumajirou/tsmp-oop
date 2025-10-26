@@ -1,0 +1,13 @@
+# /etc/systemd/system/lottery-load.timer
+[Unit]
+Description=Daily lottery load at 03:15
+
+[Timer]
+OnCalendar=*-*-* 03:15
+RandomizedDelaySec=15m
+AccuracySec=10min
+Persistent=true
+Unit=lottery-load.service
+
+[Install]
+WantedBy=timers.target
