@@ -12,12 +12,9 @@ Rules:
     - SQLite    : 'YYYY-MM-DD HH:MM:SS' UTC string
 - Config is normalized to {"config": {...}} (expects $.config.horizon).
 """
-
 from __future__ import annotations
 
-import argparse
-import json
-import os
+import argparse, json, os
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Iterable, Optional, List, Dict, Tuple
@@ -31,9 +28,6 @@ try:
 except Exception:
     yaml = None
 
-
-# ---------- time utils ----------
-
 def _utc_now_pg():
     return datetime.now(timezone.utc)
 
@@ -46,9 +40,6 @@ def _to_utc(series) -> pd.Series:
 
 def _to_sqlite_utc_text(series_utc: pd.Series) -> pd.Series:
     return series_utc.dt.tz_localize(None).dt.strftime("%Y-%m-%d %H:%M:%S")
-
-
-# ---------- load / normalize ----------
 
 def _load_last_run_json(p: Path) -> dict:
     d = json.loads(p.read_text(encoding="utf-8"))
@@ -86,9 +77,6 @@ def _read_predictions_frame(path: Path) -> pd.DataFrame:
         return pd.read_parquet(path)
     except Exception:
         return pd.read_csv(path)
-
-
-# ---------- column detection on dataframe ----------
 
 def _detect_col(cols: List[str], candidates: List[str]) -> Optional[str]:
     lower = {c.lower(): c for c in cols}
@@ -130,24 +118,12 @@ def _pick_value_col(df: pd.DataFrame) -> str:
     raise ValueError("predictions file must provide a numeric prediction column; "
                      "tried: " + ", ".join(_VAL_CANDIDATES))
 
-
-# ---------- choose destination value column existing in table ----------
-
-_NUMERIC_HINTS_SQLITE = ("INT", "REAL", "FLOA", "DOUB", "NUM")  # partials for affinity
+_NUMERIC_HINTS_SQLITE = ("INT", "REAL", "FLOA", "DOUB", "NUM")
 _EXCLUDE_COLS = {"run_id", "unique_id", "ds", "created_at", "updated_at", "id"}
 
 def _pick_dst_value_col(engine: Engine) -> str:
-    """
-    Inspect the *table* and pick the real value column.
-
-    Priority:
-      1) any numeric-typed column except excluded keys
-      2) first present among (yhat, yhat_mean, pred, forecast) (case-insensitive)
-      3) any remaining non-excluded column
-    """
     dialect = engine.url.get_backend_name()
     have: List[Tuple[str, Optional[str]]] = []
-
     with engine.begin() as conn:
         if dialect == "sqlite":
             rows = conn.execute(text("PRAGMA table_info(predictions)")).mappings().all()
@@ -157,14 +133,11 @@ def _pick_dst_value_col(engine: Engine) -> str:
             q = """
             SELECT column_name, data_type
               FROM information_schema.columns
-             WHERE table_name = 'predictions'
+             WHERE table_schema = current_schema() AND table_name = 'predictions'
             """
             for name, data_type in conn.execute(text(q)).all():
                 have.append((str(name), (str(data_type) if data_type is not None else None)))
-
     names = [n for n, _ in have]
-
-    # 1) numeric-typed first
     for n, t in have:
         if n in _EXCLUDE_COLS:
             continue
@@ -174,74 +147,49 @@ def _pick_dst_value_col(engine: Engine) -> str:
                 "DOUBLE PRECISION", "REAL", "NUMERIC", "INTEGER", "BIGINT", "SMALLINT", "DECIMAL", "FLOAT"
             }:
                 return n
-
-    # 2) canonical candidates case-insensitive
     lower_map = {n.lower(): n for n in names}
     for cand in ["yhat", "yhat_mean", "pred", "forecast"]:
         if cand in lower_map:
             return lower_map[cand]
-
-    # 3) last-resort: first non-excluded column
     for n in names:
         if n not in _EXCLUDE_COLS:
             return n
-
-    # desperate fallback (should not happen if table exists)
     return "yhat"
 
-
-# ---------- row builders ----------
-
 def _rows_pg_dict(run_id: str, df: pd.DataFrame) -> Iterable[Dict[str, object]]:
+    # ← ここを DataFrame 行反復にして ndarray.loc 問題を回避
     uid_col = _pick_uid_col(df)
     ts = _pick_ts_series(df)
     val_col = _pick_value_col(df)
-
-    uid = df[uid_col].astype(str)
-    ts_utc = _to_utc(ts)  # tz-aware UTC pandas Series
-    val = pd.to_numeric(df[val_col], errors="coerce")
-
-    mask = (~uid.isna()) & (~ts_utc.isna()) & (~val.isna())
-    idx = df.index[mask]
-
-    # ndarray を作らず、各行で pydatetime 化（tz-aware のまま）
-    for i in idx:
-        ds_py = ts_utc.loc[i].to_pydatetime()  # ← ここが安全
+    df2 = pd.DataFrame({
+        "unique_id": df[uid_col].astype(str),
+        "ds": _to_utc(ts),
+        "val": pd.to_numeric(df[val_col], errors="coerce"),
+    }).dropna(subset=["unique_id", "ds", "val"])
+    for _, r in df2.iterrows():
         yield {
             "run_id": run_id,
-            "unique_id": str(uid.loc[i]),
-            "ds": ds_py,                  # tz-aware UTC datetime
-            "val": float(val.loc[i]),
+            "unique_id": r["unique_id"],
+            "ds": r["ds"].to_pydatetime(),
+            "val": float(r["val"]),
         }
 
 def _rows_sqlite_tuple4(run_id: str, df: pd.DataFrame) -> Iterable[Tuple[object, ...]]:
     uid_col = _pick_uid_col(df)
     ts = _pick_ts_series(df)
     val_col = _pick_value_col(df)
-
     uid = df[uid_col].astype(str)
     ts_utc = _to_utc(ts)
     ts_txt = _to_sqlite_utc_text(ts_utc)
     val = pd.to_numeric(df[val_col], errors="coerce")
-
     mask = (~uid.isna()) & (~ts_txt.isna()) & (~val.isna())
     idx = df.index[mask]
-
     for i in idx:
         yield (run_id, str(uid.loc[i]), str(ts_txt.loc[i]), float(val.loc[i]))
 
-
-# ---------- main persist ----------
-
-def persist(
-    dsn: str,
-    run_json: Path,
-    run_config: Path | None,
-    pred_file: Path | None,
-):
+def persist(dsn: str, run_json: Path, run_config: Path | None, pred_file: Path | None):
     last = _load_last_run_json(run_json)
     cfg = _load_run_config_yaml(run_config)
-
     run_id = str(last["run_id"])
     status = str(last.get("status") or "SUCCEEDED")
     alias = str(last.get("alias") or run_id[:8])
@@ -253,17 +201,14 @@ def persist(
             duration_sec = float(duration_sec)
         except Exception:
             duration_sec = None
-
     config_str = _normalize_config(last, cfg)
 
     eng = create_engine(dsn, pool_pre_ping=True)
     dialect = eng.url.get_backend_name()
 
-    # ----- runs upsert -----
     if dialect == "postgresql":
         created_at = updated_at = _utc_now_pg()
-        sql_runs = text(
-            """
+        sql_runs = text("""
             INSERT INTO runs
                 (run_id, alias, model_name, dataset, status,
                  duration_sec, created_at, updated_at, config)
@@ -278,23 +223,15 @@ def persist(
                 duration_sec = EXCLUDED.duration_sec,
                 updated_at = EXCLUDED.updated_at,
                 config = EXCLUDED.config
-            """
-        )
+        """)
         runs_params = {
-            "run_id": run_id,
-            "alias": alias,
-            "model_name": model_name,
-            "dataset": dataset,
-            "status": status,
-            "duration_sec": duration_sec,
-            "created_at": created_at,
-            "updated_at": updated_at,
-            "config": config_str,
+            "run_id": run_id, "alias": alias, "model_name": model_name, "dataset": dataset,
+            "status": status, "duration_sec": duration_sec,
+            "created_at": created_at, "updated_at": updated_at, "config": config_str,
         }
     else:
         created_at = updated_at = _utc_now_sqlite_str()
-        sql_runs = text(
-            """
+        sql_runs = text("""
             INSERT INTO runs
                 (run_id, alias, model_name, dataset, status,
                  duration_sec, created_at, updated_at, config)
@@ -309,41 +246,24 @@ def persist(
                 duration_sec = excluded.duration_sec,
                 updated_at = excluded.updated_at,
                 config = excluded.config
-            """
-        )
+        """)
         runs_params = {
-            "run_id": run_id,
-            "alias": alias,
-            "model_name": model_name,
-            "dataset": dataset,
-            "status": status,
-            "duration_sec": duration_sec,
-            "created_at": created_at,
-            "updated_at": updated_at,
-            "config": config_str,
+            "run_id": run_id, "alias": alias, "model_name": model_name, "dataset": dataset,
+            "status": status, "duration_sec": duration_sec,
+            "created_at": created_at, "updated_at": updated_at, "config": config_str,
         }
 
     inserted_count = 0
-
     with eng.begin() as conn:
         conn.execute(sql_runs, runs_params)
-
-        # ----- predictions ingest (optional) -----
         if pred_file:
-            if not pred_file.exists():
+            if not Path(pred_file).exists():
                 raise FileNotFoundError(str(pred_file))
-
-            df = _read_predictions_frame(pred_file)
-
-            # 既存行を run_id 単位で削除
+            df = _read_predictions_frame(Path(pred_file))
             conn.execute(text("DELETE FROM predictions WHERE run_id = :rid"), {"rid": run_id})
-
             if df is None or df.empty:
-                print(run_id)
-                return
-
+                print(run_id); return
             dst_val_col = _pick_dst_value_col(eng)
-
             if dialect == "postgresql":
                 rows = list(_rows_pg_dict(run_id, df))
                 if rows:
@@ -355,9 +275,6 @@ def persist(
                     inserted_count = len(rows)
             else:
                 rows = list(_rows_sqlite_tuple4(run_id, df))
-                if rows and not all(len(r) == 4 for r in rows):
-                    raise RuntimeError(f"internal: expected 4-tuple per row, got lens="
-                                       f"{set(len(r) for r in rows)}; example={rows[:3]}")
                 if rows:
                     conn.exec_driver_sql(
                         f"INSERT INTO predictions (run_id, unique_id, ds, {dst_val_col}) VALUES (?,?,?,?)",
@@ -369,7 +286,6 @@ def persist(
         print(f"[persist] inserted predictions: {inserted_count}")
     print(run_id)
 
-
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dsn", required=True, help="database DSN (postgresql://... or sqlite:///path.db)")
@@ -379,7 +295,6 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     persist(args.dsn, args.run_json, args.run_config, args.pred_file)
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
