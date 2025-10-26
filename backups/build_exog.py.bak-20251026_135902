@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""
+Build exogenous features for time series and store them into PostgreSQL.
+
+- Source: lottery_series_long (columns: unique_id, ds, y)
+- Target: lottery_exog (columns: unique_id, ds, futr_*, hist_*, stat_*)
+- Meta:   lottery_exog_meta (single row: futr_exog_list text[], hist_exog_list text[], stat_exog_list text[])
+         lottery_exog_col_index (rows: exog_type text, colname text)
+
+Features:
+  futr_ (known-in-advance):
+    - dow one-hot (0..6), month one-hot (1..12), is_weekend
+    - month/quarter/year boundaries flags
+    - cyclic encodings: doy/wofy sin & cos
+    - holiday JP flag (if jpholiday available)
+
+  hist_ (known-from-history only; per unique_id group):
+    - lags: 1..L (default 28)
+    - roll windows W in {7,14,28}: mean, std, min, max
+    - EWMA spans S in {7,14}
+
+  stat_ (static per unique_id; no time leakage):
+    - id categorical: game one-hot, position (n1..n7) integer + one-hot(1..7)
+    - global stats of y by unique_id (min/max/mean/std) computed once (constant columns)
+    - series length and start/end ordinal (constants)
+
+Fast path:
+  - Uses cuDF/cuPy if available (--gpu=auto|force|off). Fallback to pandas.
+  - Vectorized ops only; psycopg2 execute_values bulk insert.
+  - NaN/inf replaced by 0.
+
+Usage:
+  python scripts/build_exog.py --db postgresql://user:pass@host:port/db \
+      [--source lottery_series_long] [--table lottery_exog] \
+      [--max_lag 28] [--gpu auto|force|off] [--chunksize 2_000_000]
+"""
+
+import os, re, sys, math, argparse, warnings
+from datetime import datetime
+import numpy as np
+import pandas as pd
+from sqlalchemy import create_engine, text
+from psycopg2.extras import execute_values
+
+# ---------------- CFG ----------------
+ROLL_WINDOWS = [7, 14, 28]
+EWMA_SPANS   = [7, 14]
+
+# ------------- Helpers --------------
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--db", required=True, help="PostgreSQL URL")
+    ap.add_argument("--source", default="lottery_series_long")
+    ap.add_argument("--table",  default="lottery_exog")
+    ap.add_argument("--meta_table", default="lottery_exog_meta")
+    ap.add_argument("--col_index_table", default="lottery_exog_col_index")
+    ap.add_argument("--max_lag", type=int, default=28)
+    ap.add_argument("--gpu", choices=["auto","force","off"], default="auto")
+    ap.add_argument("--chunksize", type=int, default=2_000_000,
+                    help="rows per bulk insert")
+    return ap.parse_args()
+
+def try_import_gpu(gpu_mode="auto"):
+    using_gpu = False
+    cudf = cupy = None
+    if gpu_mode in ("auto","force"):
+        try:
+            import cudf, cupy
+            using_gpu = True
+            return using_gpu, cudf, cupy
+        except Exception:
+            if gpu_mode == "force":
+                raise RuntimeError("GPU mode forced but RAPIDS (cudf/cupy) not available")
+    return using_gpu, None, None
+
+def is_jp_holiday_available():
+    try:
+        import jpholiday  # noqa
+        return True
+    except Exception:
+        return False
+
+def jp_holiday_flag(dates: pd.Series) -> pd.Series:
+    if not is_jp_holiday_available():
+        return pd.Series(np.zeros(len(dates), dtype=np.int8), index=dates.index)
+    import jpholiday
+    return dates.apply(lambda d: 1 if jpholiday.is_holiday(d) else 0).astype("int8")
+
+def ensure_tables(engine, table, meta_table, idx_table):
+    ddl = f"""
+    CREATE TABLE IF NOT EXISTS {table} (
+      unique_id TEXT NOT NULL,
+      ds        DATE NOT NULL,
+      -- futr/hist/stat features will be added via CREATE TABLE AS or ALTER dynamically.
+      -- We will recreate table (drop/create) for simplicity & speed in this script.
+      PRIMARY KEY (unique_id, ds)
+    );
+    """
+    meta = f"""
+    CREATE TABLE IF NOT EXISTS {meta_table} (
+      id SMALLINT PRIMARY KEY DEFAULT 1,
+      futr_exog_list TEXT[] NOT NULL,
+      hist_exog_list TEXT[] NOT NULL,
+      stat_exog_list TEXT[] NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """
+    idx = f"""
+    CREATE TABLE IF NOT EXISTS {idx_table} (
+      exog_type TEXT NOT NULL, -- 'futr' | 'hist' | 'stat'
+      colname   TEXT NOT NULL,
+      PRIMARY KEY (exog_type, colname)
+    );
+    """
+    with engine.begin() as con:
+        # Drop & create will be done later after feature frame is built (so we know columns).
+        con.execute(text(meta))
+        con.execute(text(idx))
+
+def drop_recreate_target(engine, table, all_cols):
+    # Recreate target table with all columns in 1 shot for speed
+    cols_sql = ["unique_id TEXT NOT NULL", "ds DATE NOT NULL"]
+    for c, dtype in all_cols.items():
+        if c in ("unique_id","ds"): continue
+        # map dtype to SQL
+        if dtype in ("int8","int16","int32","int64"):
+            sqlt = "INTEGER"
+        elif dtype in ("float16","float32","float64"):
+            sqlt = "DOUBLE PRECISION"
+        else:
+            sqlt = "DOUBLE PRECISION"
+        cols_sql.append(f"{c} {sqlt} NOT NULL")
+    ddl = f"""
+    DROP TABLE IF EXISTS {table};
+    CREATE TABLE {table} (
+      {", ".join(cols_sql)},
+      PRIMARY KEY (unique_id, ds)
+    );
+    CREATE INDEX {table}_ds_idx ON {table}(ds);
+    """
+    with engine.begin() as con:
+        con.execute(text(ddl))
+
+def upsert_meta(engine, meta_table, idx_table, futr_cols, hist_cols, stat_cols):
+    with engine.begin() as con:
+        con.execute(text(f"DELETE FROM {meta_table} WHERE id=1"))
+        con.execute(
+            text(f"INSERT INTO {meta_table}(id, futr_exog_list, hist_exog_list, stat_exog_list) VALUES (1, :f::text[], :h::text[], :s::text[]"),
+            {"f": futr_cols, "h": hist_cols, "s": stat_cols}
+        )
+        con.execute(text(f"DELETE FROM {idx_table}"))
+        rows = [("futr", c) for c in futr_cols] + [("hist", c) for c in hist_cols] + [("stat", c) for c in stat_cols]
+        if rows:
+            values = ",".join(["(:t{}, :c{})".format(i,i) for i in range(len(rows))])
+            params = {f"t{i}": t for i,(t,_) in enumerate(rows)}
+            params.update({f"c{i}": c for i,(_,c) in enumerate(rows)})
+            con.execute(text(f"INSERT INTO {idx_table}(exog_type, colname) VALUES {values}"), params)
+
+def split_unique_id(uid: str):
+    """
+    'loto6_n2' -> ('loto6', 2)
+    'numbers4_n1' -> ('numbers4', 1)
+    """
+    m = re.match(r"^([a-z0-9]+)_n(\d+)$", uid)
+    if not m:
+        return uid, None
+    return m.group(1), int(m.group(2))
+
+def build_features_pandas(df: pd.DataFrame, max_lag: int) -> pd.DataFrame:
+    # Ensure types
+    df = df.copy()
+    df["ds"] = pd.to_datetime(df["ds"]).dt.tz_localize(None).dt.date
+    df["ds"] = pd.to_datetime(df["ds"])  # back to Timestamp for dt accessors
+    df["y"] = pd.to_numeric(df["y"], errors="coerce").fillna(0).astype("float32")
+
+    # ---------- futr (calendar, no leakage) ----------
+    dtidx = df["ds"]
+    dow = dtidx.dt.weekday  # 0=Mon
+    month = dtidx.dt.month
+    is_weekend = ((dow >= 5).astype("int8"))
+
+    futr = pd.DataFrame(index=df.index)
+    # one-hot for dow
+    for d in range(7):
+        futr[f"futr_dow_{d}"] = (dow == d).astype("int8")
+    # one-hot for month
+    for m in range(1,13):
+        futr[f"futr_month_{m:02d}"] = (month == m).astype("int8")
+    # flags
+    futr["futr_is_weekend"] = is_weekend
+    futr["futr_is_month_start"]   = dtidx.dt.is_month_start.astype("int8")
+    futr["futr_is_month_end"]     = dtidx.dt.is_month_end.astype("int8")
+    futr["futr_is_quarter_start"] = dtidx.dt.is_quarter_start.astype("int8")
+    futr["futr_is_quarter_end"]   = dtidx.dt.is_quarter_end.astype("int8")
+    futr["futr_is_year_start"]    = dtidx.dt.is_year_start.astype("int8")
+    futr["futr_is_year_end"]      = dtidx.dt.is_year_end.astype("int8")
+    # cyclic
+    doy = dtidx.dt.dayofyear.astype("int32")
+    woy = dtidx.dt.isocalendar().week.astype(int)
+    futr["futr_doy_sin"] = np.sin(2*np.pi*doy/365.0).astype("float32")
+    futr["futr_doy_cos"] = np.cos(2*np.pi*doy/365.0).astype("float32")
+    futr["futr_woy_sin"] = np.sin(2*np.pi*woy/52.0).astype("float32")
+    futr["futr_woy_cos"] = np.cos(2*np.pi*woy/52.0).astype("float32")
+    # JP holiday
+    futr["futr_is_holiday_jp"] = jp_holiday_flag(dtidx.dt.date)
+
+    # ---------- hist (group-wise lags/rolls) ----------
+    df_sorted = df.sort_values(["unique_id","ds"]).reset_index(drop=True)
+    groups = df_sorted.groupby("unique_id", sort=False, group_keys=False)
+
+    hist = pd.DataFrame(index=df_sorted.index)
+    # lags
+    for L in range(1, max_lag+1):
+        hist[f"hist_lag_{L}"] = groups["y"].shift(L)
+
+    # rolling windows
+    for W in ROLL_WINDOWS:
+        g = groups["y"].rolling(window=W, min_periods=1)
+        hist[f"hist_roll{W}_mean"] = g.mean().reset_index(level=0, drop=True)
+        hist[f"hist_roll{W}_std"]  = g.std(ddof=0).reset_index(level=0, drop=True)
+        hist[f"hist_roll{W}_min"]  = g.min().reset_index(level=0, drop=True)
+        hist[f"hist_roll{W}_max"]  = g.max().reset_index(level=0, drop=True)
+
+    # EWMA
+    for S in EWMA_SPANS:
+        hist[f"hist_ewm{S}_mean"] = groups["y"].apply(lambda s: s.shift(1).ewm(span=S, adjust=False).mean())
+
+    # ---------- stat (static per unique_id) ----------
+    # global stats (constant per unique_id)
+    gstats = groups["y"].agg(["min","max","mean","std","count"]).reset_index()
+    gstats = gstats.rename(columns={
+        "min":"stat_y_min","max":"stat_y_max","mean":"stat_y_mean","std":"stat_y_std","count":"stat_len"
+    })
+    # first/last date ordinal (constant)
+    grng = df_sorted.groupby("unique_id", sort=False)["ds"].agg(["min","max"]).reset_index()
+    grng["stat_start_ord"] = ((grng["min"].dt.floor("D") - pd.Timestamp("1970-01-01")).dt.days.astype("int32"))
+    grng["stat_end_ord"]   = ((grng["max"].dt.floor("D") - pd.Timestamp("1970-01-01")).dt.days.astype("int32"))
+    grng = grng[["unique_id","stat_start_ord","stat_end_ord"]]
+
+    stat = df_sorted[["unique_id"]].copy()
+    stat = stat.merge(gstats, on="unique_id", how="left")
+    stat = stat.merge(grng, on="unique_id", how="left")
+
+    # game / position one-hots
+    parsed = df_sorted["unique_id"].map(split_unique_id)
+    games = parsed.map(lambda x: x[0])
+    pos   = parsed.map(lambda x: 0 if x[1] is None else int(x[1]))
+    stat["stat_pos"] = pos.astype("int16")
+    # game one-hot
+    for gval in sorted(games.unique()):
+        stat[f"stat_game_{gval}"] = (games == gval).astype("int8")
+    # position one-hot 1..7
+    for p in range(1,8):
+        stat[f"stat_pos_{p}"] = (stat["stat_pos"] == p).astype("int8")
+
+    # ---------- align frames back to original order ----------
+    df_out = pd.DataFrame({
+        "unique_id": df_sorted["unique_id"].values,
+        "ds":        df_sorted["ds"].dt.date.values
+    })
+    df_out = pd.concat([df_out, futr.loc[df_sorted.index].reset_index(drop=True),
+                        hist.reset_index(drop=True),
+                        stat.reset_index(drop=True)], axis=1)
+
+    # fill NaN/inf -> 0
+    df_out.replace([np.inf, -np.inf], 0, inplace=True)
+    df_out.fillna(0, inplace=True)
+
+    # downcast
+    for c in df_out.columns:
+        if c in ("unique_id","ds"): continue
+        if df_out[c].dtype.kind == "f":
+            df_out[c] = df_out[c].astype("float32")
+        elif df_out[c].dtype.kind in ("i","b","u"):
+            df_out[c] = pd.to_numeric(df_out[c], downcast="integer")
+
+    return df_out
+
+def build_features_gpu_cudf(df: pd.DataFrame, max_lag: int, cudf, cupy):
+    # Convert to cuDF
+    gdf = cudf.from_pandas(df)
+    gdf["ds"] = cudf.to_datetime(gdf["ds"])
+    gdf["y"]  = gdf["y"].astype("float32")
+
+    # ---------- futr ----------
+    dt = gdf["ds"].dt
+    futr = cudf.DataFrame(index=gdf.index)
+    dow = dt.weekday
+    month = dt.month
+
+    for d in range(7):
+        futr[f"futr_dow_{d}"] = (dow == d).astype("int8")
+    for m in range(1,13):
+        futr[f"futr_month_{m:02d}"] = (month == m).astype("int8")
+    futr["futr_is_weekend"] = (dow >= 5).astype("int8")
+    futr["futr_is_month_start"]   = dt.is_month_start.astype("int8")
+    futr["futr_is_month_end"]     = dt.is_month_end.astype("int8")
+    futr["futr_is_quarter_start"] = dt.is_quarter_start.astype("int8")
+    futr["futr_is_quarter_end"]   = dt.is_quarter_end.astype("int8")
+    futr["futr_is_year_start"]    = dt.is_year_start.astype("int8")
+    futr["futr_is_year_end"]      = dt.is_year_end.astype("int8")
+
+    doy = dt.day_of_year.astype("int32")
+    # cudf lacks sin/cos on Series directly; go via cupy
+    futr["futr_doy_sin"] = cupy.sin(2*cupy.pi*doy.values/365.0).astype("float32")
+    futr["futr_doy_cos"] = cupy.cos(2*cupy.pi*doy.values/365.0).astype("float32")
+    # week-of-year via pandas conversion (fallback)
+    woy = cudf.Series(pd.to_datetime(df["ds"]).dt.isocalendar().week.astype(int))
+    futr["futr_woy_sin"] = cupy.sin(2*cupy.pi*woy.values/52.0).astype("float32")
+    futr["futr_woy_cos"] = cupy.cos(2*cupy.pi*woy.values/52.0).astype("float32")
+    # JP holiday (CPU side, then join)
+    futr["futr_is_holiday_jp"] = cudf.from_pandas(jp_holiday_flag(pd.to_datetime(df["ds"]).dt.date))
+
+    # ---------- hist ----------
+    gdf = gdf.sort_values(["unique_id","ds"])
+    hist = cudf.DataFrame(index=gdf.index)
+
+    # lags
+    for L in range(1, max_lag+1):
+        hist[f"hist_lag_{L}"] = gdf.groupby("unique_id").y.shift(L)
+
+    # rolling stats
+    for W in ROLL_WINDOWS:
+        grp = gdf.groupby("unique_id").y
+        hist[f"hist_roll{W}_mean"] = grp.rolling(window=W, min_periods=1).mean().reset_index(drop=True)
+        hist[f"hist_roll{W}_std"]  = grp.rolling(window=W, min_periods=1).std().fillna(0).reset_index(drop=True)
+        hist[f"hist_roll{W}_min"]  = grp.rolling(window=W, min_periods=1).min().reset_index(drop=True)
+        hist[f"hist_roll{W}_max"]  = grp.rolling(window=W, min_periods=1).max().reset_index(drop=True)
+
+    # EWMA via CPU fallback (cudf has ewm in recent versions; be safe)
+    ewms = {}
+    pdf_sorted = gdf.to_pandas()
+    groups = pdf_sorted.groupby("unique_id", sort=False)
+    for S in EWMA_SPANS:
+        ewms[f"hist_ewm{S}_mean"] = groups["y"].apply(lambda s: s.shift(1).ewm(span=S, adjust=False).mean()).values
+    hist = cudf.concat([hist, cudf.DataFrame(ewms)], axis=1)
+
+    # ---------- stat ----------
+    tmp = gdf.to_pandas()
+    stat_pdf = build_features_pandas(tmp[["unique_id","ds","y"]], max_lag=1)  # use pandas stat builder
+    keep_stat = [c for c in stat_pdf.columns if c.startswith("stat_")]
+    stat = cudf.from_pandas(stat_pdf[keep_stat])
+
+    out = cudf.concat([
+        gdf[["unique_id","ds"]],
+        futr.reset_index(drop=True),
+        hist.reset_index(drop=True),
+        stat.reset_index(drop=True)
+    ], axis=1)
+
+    # fill NaN/inf -> 0
+    out = out.replace([cupy.inf, -cupy.inf], 0)
+    out = out.fillna(0)
+
+    # finalize
+    pdf = out.to_pandas()
+    pdf["ds"] = pd.to_datetime(pdf["ds"]).dt.date
+    # downcast
+    for c in pdf.columns:
+        if c in ("unique_id","ds"): continue
+        if pdf[c].dtype.kind == "f":
+            pdf[c] = pdf[c].astype("float32")
+        elif pdf[c].dtype.kind in ("i","b","u"):
+            pdf[c] = pd.to_numeric(pdf[c], downcast="integer")
+    return pdf
+
+def main():
+    warnings.filterwarnings("ignore")
+    args = parse_args()
+
+    engine = create_engine(args.db, pool_pre_ping=True)
+    ensure_tables(engine, args.table, args.meta_table, args.col_index_table)
+
+    # ---- load source long view ----
+    q = text(f"SELECT unique_id, ds, y FROM {args.source}")
+    df = pd.read_sql(q, engine)
+    if df.empty:
+        print("No data in source view; abort.")
+        sys.exit(0)
+
+    # GPU?
+    use_gpu, cudf, cupy = try_import_gpu(args.gpu)
+    print(f"[exog] rows={len(df):,} unique_ids={df['unique_id'].nunique()} gpu={use_gpu}")
+
+    # ---- build features ----
+    if use_gpu:
+        feat = build_features_gpu_cudf(df, args.max_lag, cudf, cupy)
+    else:
+        feat = build_features_pandas(df, args.max_lag)
+
+    # Column order
+    base = ["unique_id","ds"]
+    futr_cols = [c for c in feat.columns if c.startswith("futr_")]
+    hist_cols = [c for c in feat.columns if c.startswith("hist_")]
+    stat_cols = [c for c in feat.columns if c.startswith("stat_")]
+    cols = base + futr_cols + hist_cols + stat_cols
+    feat = feat[cols]
+    feat = feat.loc[:, ~feat.columns.duplicated()]
+    feat = feat.replace([np.inf, -np.inf], 0).fillna(0)
+
+    # recreate target to exact schema
+    dtypes_map = {c: ("int32" if str(feat[c].dtype).startswith("int") else
+                      "float32" if str(feat[c].dtype).startswith("float") else "float32")
+                  for c in feat.columns}
+    drop_recreate_target(engine, args.table, dtypes_map)
+
+    # ---- bulk insert ----
+    tuples = [tuple(x) for x in feat.itertuples(index=False, name=None)]
+    col_sql = ",".join(cols)
+    sql = f"INSERT INTO {args.table} ({col_sql}) VALUES %s ON CONFLICT (unique_id, ds) DO NOTHING"
+    with engine.begin() as conn:
+        with conn.connection.cursor() as cur:
+            for i in range(0, len(tuples), args.chunksize):
+                execute_values(cur, sql, tuples[i:i+args.chunksize])
+    print(f"[exog] inserted rows: {len(tuples):,} into {args.table}")
+
+    # ---- meta tables ----
+    upsert_meta(engine, args.meta_table, args.col_index_table, futr_cols, hist_cols, stat_cols)
+    print(f"[meta] futr={len(futr_cols)} hist={len(hist_cols)} stat={len(stat_cols)}")
+
+if __name__ == "__main__":
+    main()
