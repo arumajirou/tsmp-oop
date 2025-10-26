@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      POSTGRES_DSN: "sqlite:///ci.db"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt
+          pip install httpx uvicorn
+
+      - name: Prepare CI DB & data
+        run: |
+          python scripts/setup_db.py --init --dsn "$POSTGRES_DSN" --sql sql/init_schema.sql
+          python scripts/cli.py run --run-config configs/run_spec.yaml --fe-config configs/fe_config.yaml --constraints configs/constraints.yaml
+          python scripts/persist_to_db.py --dsn "$POSTGRES_DSN" --run-json outputs/last_run.json --run-config configs/run_spec.yaml --pred-file outputs/predictions.parquet
+          python scripts/create_predictions_view.py --dsn "$POSTGRES_DSN"
+
+      - name: Download promtool
+        run: |
+          set -eux
+          PROM_VER=2.53.3
+          curl -fsSL -o /tmp/prom.tar.gz https://github.com/prometheus/prometheus/releases/download/v${PROM_VER}/prometheus-${PROM_VER}.linux-amd64.tar.gz
+          tar -C /tmp -xf /tmp/prom.tar.gz
+          sudo mv /tmp/prometheus-${PROM_VER}.linux-amd64/promtool /usr/local/bin/promtool
+          promtool --version
+
+      - name: Validate Prometheus config & rules
+        working-directory: monitoring
+        run: |
+          promtool check config prometheus.yml
+          promtool check rules tsmp_rules.yml
+
+      - name: Pytest (smoke)
+        run: pytest -q
