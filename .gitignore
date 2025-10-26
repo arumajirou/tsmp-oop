@@ -15,3 +15,7 @@ htmlcov/
 # outputs: generally ignore, but keep the canonical artifact
 outputs/*
 !outputs/last_run.json
+tsapi.db
+outputs/
+outputs/*.parquet
+outputs/*.json
