@@ -1,11 +1,14 @@
 # src/tsmp/api/app.py
-from fastapi import FastAPI, HTTPException, Query, status as http_status
+from fastapi import FastAPI, HTTPException, Query, status as http_status, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import create_engine, text
 from datetime import datetime, timezone
 import os
+
+# --- Prometheus ---
+from prometheus_client import Counter, Histogram, Gauge, CONTENT_TYPE_LATEST, generate_latest
 
 app = FastAPI(title="tsmp-oop")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -13,6 +16,62 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 DSN = os.getenv("POSTGRES_DSN", "postgresql:///tsmodeling")
 engine = create_engine(DSN, pool_pre_ping=True)
 
+# ---------- Prometheus metrics ----------
+REQ_COUNT = Counter(
+    "http_requests_total",
+    "Total HTTP requests",
+    ["method", "path", "status"],
+)
+
+REQ_LATENCY = Histogram(
+    "http_request_duration_seconds",
+    "Request latency (seconds)",
+    ["method", "path", "status"],
+    buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0],
+)
+
+TSMP_HEALTH_OK = Gauge("tsmp_health_ok", "1 if /health is OK else 0")
+TSMP_RUNS_COUNT = Gauge("tsmp_runs_count", "Total number of rows in runs table")
+TSMP_PREDICTIONS_COUNT = Gauge("tsmp_predictions_count", "Total number of predictions for latest run_id")
+
+def _safe_path_label(request: Request) -> str:
+    # ルートテンプレートを優先（クエリは含めない）
+    route = request.scope.get("route")
+    if route and getattr(route, "path", None):
+        return route.path
+    return request.url.path
+
+@app.middleware("http")
+async def prometheus_middleware(request: Request, call_next):
+    method = request.method
+    path = _safe_path_label(request)
+    start = datetime.now().timestamp()
+    try:
+        response = await call_next(request)
+        status = str(response.status_code)
+        return response
+    except Exception:
+        # 例外は 500 としてカウント
+        status = "500"
+        REQ_COUNT.labels(method=method, path=path, status=status).inc()
+        dur = max(0.0, datetime.now().timestamp() - start)
+        REQ_LATENCY.labels(method=method, path=path, status=status).observe(dur)
+        raise
+    finally:
+        # 正常終了/異常終了どちらもここでレコード
+        end = datetime.now().timestamp()
+        dur = max(0.0, end - start)
+        # status が未設定（例外ルート）の場合は上の except で処理済み
+        if "status" not in locals() or status == "500":
+            pass
+        else:
+            REQ_COUNT.labels(method=method, path=path, status=status).inc()
+            REQ_LATENCY.labels(method=method, path=path, status=status).observe(dur)
+
+@app.get("/metrics")
+def metrics():
+    # その時点のメトリクスを出力
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 # ---------- helpers ----------
 def _mlflow_hint(run_name: str) -> dict | None:
@@ -36,7 +95,6 @@ def _mlflow_hint(run_name: str) -> dict | None:
         ui_url = base
     return {"tracking_uri": tracking, "experiment": exp_name, "ui_url": ui_url}
 
-
 def _parse_utc_ceil(s: str | None):
     if not s:
         return None
@@ -48,7 +106,6 @@ def _parse_utc_ceil(s: str | None):
     if dt.tzinfo:
         dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt
-
 
 def _list_table_columns(conn, table: str, dialect: str) -> list[str]:
     if dialect == "sqlite":
@@ -64,7 +121,6 @@ def _list_table_columns(conn, table: str, dialect: str) -> list[str]:
         ).all()
         return [r[0] for r in rows]
 
-
 def _resolve_pred_y_expr(conn, dialect: str) -> str:
     cols = set(_list_table_columns(conn, "predictions", dialect))
     for cand in ("yhat", "y_pred", "prediction", "y", "value", "y_hat", "yhat_mean", "pred", "forecast"):
@@ -72,24 +128,30 @@ def _resolve_pred_y_expr(conn, dialect: str) -> str:
             return f"p.{cand} AS yhat"
     return "NULL AS yhat"
 
-
-def _view_exists(conn, view_name: str, dialect: str) -> bool:
+def _view_exists(conn, name: str, dialect: str) -> bool:
     if dialect == "sqlite":
-        row = conn.execute(
-            text("SELECT name FROM sqlite_master WHERE type='view' AND name=:v"),
-            {"v": view_name},
-        ).first()
-        return bool(row)
+        q = "SELECT name FROM sqlite_master WHERE type='view' AND name=:n"
+        return conn.execute(text(q), {"n": name}).first() is not None
     else:
-        row = conn.execute(
-            text(
-                "SELECT 1 FROM information_schema.views "
-                "WHERE table_schema = current_schema() AND table_name = :v"
-            ),
-            {"v": view_name},
-        ).first()
-        return bool(row)
+        q = """
+        SELECT 1
+          FROM information_schema.views
+         WHERE table_schema = current_schema() AND table_name = :n
+        """
+        return conn.execute(text(q), {"n": name}).first() is not None
 
+def _update_domain_gauges(conn, dialect: str):
+    # runs 総数
+    total_runs = int(conn.execute(text("SELECT count(*) FROM runs")).scalar_one())
+    TSMP_RUNS_COUNT.set(total_runs)
+    # 最新 run の predictions 件数
+    latest = conn.execute(text("SELECT run_id FROM runs ORDER BY created_at DESC LIMIT 1")).first()
+    if latest:
+        rid = latest[0]
+        n_pred = int(conn.execute(text("SELECT count(*) FROM predictions WHERE run_id=:r"), {"r": rid}).scalar_one())
+        TSMP_PREDICTIONS_COUNT.set(n_pred)
+    else:
+        TSMP_PREDICTIONS_COUNT.set(0)
 
 # ---------- models ----------
 class RunRow(BaseModel):
@@ -105,7 +167,6 @@ class RunRow(BaseModel):
     updated_at: str
     horizon: int | None = None
     n_predictions: int | None = None
-
 
 # ---------- /runs (list) ----------
 @app.get("/runs")
@@ -142,9 +203,10 @@ def list_runs(
     with engine.begin() as conn:
         items = [dict(m) for m in conn.execute(text(sql_items), params).mappings().all()]
         total = int(conn.execute(text(sql_cnt), params).scalar_one())
+        # ゲージ更新（副作用OK）
+        _update_domain_gauges(conn, dialect)
 
     return {"total": total, "count": len(items), "items": items}
-
 
 # ---------- /runs/latest ----------
 @app.get("/runs/latest", response_model=RunRow)
@@ -174,8 +236,9 @@ def latest_run():
             raise HTTPException(404, "no runs")
         d = dict(row)
         d["mlflow"] = _mlflow_hint(d["run_id"])
+        # ゲージ更新
+        _update_domain_gauges(conn, dialect)
         return d
-
 
 # ---------- /predictions ----------
 @app.get("/predictions")
@@ -201,25 +264,25 @@ def predictions(
     start_dt = _parse_utc_ceil(start)
     end_dt = _parse_utc_ceil(end)
 
-    where = ["v.run_id = :rid"]
+    where = ["p.run_id = :rid"]
     params: dict = {"rid": run_id, "lim": limit, "off": offset}
 
     if dialect == "postgresql":
-        ds_expr = "to_char(v.ds AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS ds"
+        ds_expr = "to_char(p.ds AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS ds"
         if start_dt is not None:
-            where.append("v.ds >= CAST(:start AS timestamptz)")
+            where.append("p.ds >= CAST(:start AS timestamptz)")
             params["start"] = start_dt
         if end_dt is not None:
-            where.append("v.ds < CAST(:end AS timestamptz)")
+            where.append("p.ds < CAST(:end AS timestamptz)")
             params["end"] = end_dt
     else:
-        ds_expr = "strftime('%Y-%m-%dT%H:%M:%SZ', v.ds) AS ds"
+        ds_expr = "strftime('%Y-%m-%dT%H:%M:%SZ', p.ds) AS ds"
         if start_dt is not None:
             params["start"] = start_dt.strftime("%Y-%m-%d %H:%M:%S")
-            where.append("v.ds >= :start")
+            where.append("p.ds >= :start")
         if end_dt is not None:
             params["end"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
-            where.append("v.ds < :end")
+            where.append("p.ds < :end")
 
     # IN 句（ユニークID）
     if uids:
@@ -228,34 +291,31 @@ def predictions(
             k = f"u{i}"
             params[k] = u
             ph.append(":" + k)
-        where.append(f"v.unique_id IN ({','.join(ph)})")
+        where.append(f"p.unique_id IN ({','.join(ph)})")
 
     where_sql = " AND ".join(where)
 
     with engine.begin() as conn:
         use_view = _view_exists(conn, "predictions_view", dialect)
         if use_view:
-            sql = f"""
-              SELECT v.run_id, v.unique_id, {ds_expr}, v.yhat
-              FROM predictions_view v
-              WHERE {where_sql}
-              ORDER BY v.ds {order_sql}
-              LIMIT :lim OFFSET :off
-            """
+            y_expr = "p.yhat AS yhat"
+            from_src = "predictions_view p"
         else:
-            # フォールバック：テーブルから動的に yhat を解決
-            y_expr = _resolve_pred_y_expr(conn, dialect).replace("p.", "v.")
-            sql = f"""
-              SELECT v.run_id, v.unique_id, {ds_expr}, {y_expr}
-              FROM predictions v
-              WHERE {where_sql}
-              ORDER BY v.ds {order_sql}
-              LIMIT :lim OFFSET :off
-            """
+            y_expr = _resolve_pred_y_expr(conn, dialect)
+            from_src = "predictions p"
+
+        sql = f"""
+          SELECT p.run_id, p.unique_id, {ds_expr}, {y_expr}
+          FROM {from_src}
+          WHERE {where_sql}
+          ORDER BY p.ds {order_sql}
+          LIMIT :lim OFFSET :off
+        """
         items = [dict(m) for m in conn.execute(text(sql), params).mappings().all()]
+        # ゲージ更新
+        _update_domain_gauges(conn, dialect)
 
     return {"total": None, "count": len(items), "items": items}
-
 
 # ---------- /runs/window ----------
 @app.get("/runs/window")
@@ -355,8 +415,9 @@ def runs_window(
     with engine.begin() as conn:
         total = int(conn.execute(text(sql_total), params).scalar_one())
         items = [dict(row) for row in conn.execute(text(sql), params).mappings().all()]
+        # ゲージ更新
+        _update_domain_gauges(conn, dialect)
         return {"total": total, "count": len(items), "items": items}
-
 
 # ---------- /health ----------
 @app.get("/health")
@@ -418,12 +479,16 @@ def health():
         r = conn.execute(text(sql_ratio)).mappings().first()
         ratio = (float(r["ratio"]) if r and r["ratio"] is not None else None)
         latest_run = (r["run_id"] if r else None)
+        # ゲージ更新
+        _update_domain_gauges(conn, dialect)
 
     ok_p95 = (p95 * 1000.0) <= KPI_DURATION_P95_MS
     ok_ratio = (ratio is None) or (ratio >= KPI_PREDICTIONS_RATIO)
     overall = bool(ok_p95 and ok_ratio)
-    status_code = http_status.HTTP_200_OK if overall else http_status.HTTP_503_SERVICE_UNAVAILABLE
+    # /health OK/NG をゲージに反映
+    TSMP_HEALTH_OK.set(1 if overall else 0)
 
+    status_code = http_status.HTTP_200_OK if overall else http_status.HTTP_503_SERVICE_UNAVAILABLE
     payload = {
         "ok": overall,
         "checks": {"duration_p95_sec": p95, "predictions_ratio": ratio, "latest_run_id": latest_run},
