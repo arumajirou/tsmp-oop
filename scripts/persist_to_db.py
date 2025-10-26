@@ -39,12 +39,11 @@ def _utc_now_pg():
 def _utc_now_sqlite_str():
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-def _to_utc(series) -> pd.Series:
+def _to_utc_aware(series: pd.Series) -> pd.Series:
     s = pd.to_datetime(series, utc=True, errors="coerce")
     return s.dt.tz_convert("UTC")
 
 def _to_sqlite_utc_text(series_utc: pd.Series) -> pd.Series:
-    # keep index; output 'YYYY-MM-DD HH:MM:SS'
     return series_utc.dt.tz_localize(None).dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -82,14 +81,13 @@ def _read_predictions_frame(path: Path) -> pd.DataFrame:
         return pd.read_parquet(path)
     if ext == ".csv":
         return pd.read_csv(path)
-    # fallback: prefer parquet, then csv
     try:
         return pd.read_parquet(path)
     except Exception:
         return pd.read_csv(path)
 
 
-# ---------- column detection ----------
+# ---------- column detection (robust) ----------
 
 def _detect_col(cols: List[str], candidates: List[str]) -> Optional[str]:
     lower = {c.lower(): c for c in cols}
@@ -151,52 +149,52 @@ def _pick_dst_value_col(engine: Engine) -> str:
             """
             rows = conn.execute(text(q)).all()
             have = {r[0] for r in rows}
-    for c in ["yhat", "yhat_mean", "pred", "forecast"]:
+    
+    # Try common prediction column names
+    candidates = [
+        "yhat", "yhat_mean", "pred", "forecast", 
+        "value", "predicted_value", "prediction", "y_pred"
+    ]
+    for c in candidates:
         if c in have:
             return c
-    return "yhat"
+    
+    # If none found, raise an error instead of defaulting
+    raise ValueError(
+        f"predictions table has no recognized value column. "
+        f"Available columns: {sorted(have)}. "
+        f"Expected one of: {candidates}"
+    )
 
 
-# ---------- row builders (方言ごとに“安全な形”で返す) ----------
+# ---------- row builders (fixed placeholder names) ----------
 
-def _rows_pg_dict(run_id: str, df: pd.DataFrame) -> Iterable[Dict[str, object]]:
+def _rows_pg(run_id: str, df: pd.DataFrame) -> Iterable[Dict[str, object]]:
     uid_col = _pick_uid_col(df)
     ts = _pick_ts_series(df)
     val_col = _pick_value_col(df)
 
     uid = df[uid_col].astype(str)
-    ts_utc = _to_utc(ts)
+    ts_utc = _to_utc_aware(ts)
     val = pd.to_numeric(df[val_col], errors="coerce")
 
-    # 同一 index でマスク
     mask = (~uid.isna()) & (~ts_utc.isna()) & (~val.isna())
-    idx = df.index[mask]
+    for u, d, y in zip(uid[mask], ts_utc[mask].dt.to_pydatetime(), val[mask]):
+        yield {"run_id": run_id, "unique_id": u, "ds": d, "val": float(y)}
 
-    ds_py = ts_utc.loc[idx].dt.to_pydatetime()
-    for i in idx:
-        yield {
-            "run_id": run_id,
-            "unique_id": str(uid.loc[i]),
-            "ds": ds_py.loc[i],        # tz-aware UTC datetime
-            "val": float(val.loc[i]),
-        }
-
-def _rows_sqlite_tuple4(run_id: str, df: pd.DataFrame) -> Iterable[Tuple[object, ...]]:
+def _rows_sqlite(run_id: str, df: pd.DataFrame) -> Iterable[Tuple[object, ...]]:
     uid_col = _pick_uid_col(df)
     ts = _pick_ts_series(df)
     val_col = _pick_value_col(df)
 
     uid = df[uid_col].astype(str)
-    ts_utc = _to_utc(ts)
-    ts_txt = _to_sqlite_utc_text(ts_utc)   # 同 index を維持
+    ts_utc = _to_utc_aware(ts)
+    ts_txt = _to_sqlite_utc_text(ts_utc)
     val = pd.to_numeric(df[val_col], errors="coerce")
 
-    # 同一 index でマスク
     mask = (~uid.isna()) & (~ts_txt.isna()) & (~val.isna())
-    idx = df.index[mask]
-
-    for i in idx:
-        yield (run_id, str(uid.loc[i]), str(ts_txt.loc[i]), float(val.loc[i]))
+    for u, d, y in zip(uid[mask], ts_txt[mask], val[mask]):
+        yield (run_id, u, str(d), float(y))
 
 
 # ---------- main persist ----------
@@ -300,8 +298,7 @@ def persist(
                 raise FileNotFoundError(str(pred_file))
 
             df = _read_predictions_frame(pred_file)
-
-            # 既存行を run_id 単位で削除
+            # Always clear existing rows for this run_id
             conn.execute(text("DELETE FROM predictions WHERE run_id = :rid"), {"rid": run_id})
 
             if df is None or df.empty:
@@ -311,8 +308,9 @@ def persist(
             dst_val_col = _pick_dst_value_col(eng)
 
             if dialect == "postgresql":
-                rows = list(_rows_pg_dict(run_id, df))
+                rows = list(_rows_pg(run_id, df))
                 if rows:
+                    # named binds with a fixed ':val' key (robust)
                     conn.execute(
                         text(f"""
                             INSERT INTO predictions (run_id, unique_id, ds, {dst_val_col})
@@ -321,8 +319,9 @@ def persist(
                         rows,
                     )
             else:
-                rows = list(_rows_sqlite_tuple4(run_id, df))
+                rows = list(_rows_sqlite(run_id, df))
                 if rows:
+                    # use positional qmarks to avoid named-binding edge cases on SQLite
                     conn.exec_driver_sql(
                         f"INSERT INTO predictions (run_id, unique_id, ds, {dst_val_col}) VALUES (?,?,?,?)",
                         rows,
