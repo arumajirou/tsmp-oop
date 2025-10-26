@@ -19,7 +19,7 @@ import argparse
 import json
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Iterable, Optional, List, Dict, Tuple
+from typing import Iterable, Optional, List, Dict
 
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -39,7 +39,7 @@ def _utc_now_pg():
 def _utc_now_sqlite_str():
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-def _to_utc_aware(series: pd.Series) -> pd.Series:
+def _to_utc(series) -> pd.Series:
     s = pd.to_datetime(series, utc=True, errors="coerce")
     return s.dt.tz_convert("UTC")
 
@@ -81,13 +81,14 @@ def _read_predictions_frame(path: Path) -> pd.DataFrame:
         return pd.read_parquet(path)
     if ext == ".csv":
         return pd.read_csv(path)
+    # 最後のフォールバック（Parquet優先）
     try:
         return pd.read_parquet(path)
     except Exception:
         return pd.read_csv(path)
 
 
-# ---------- column detection (robust) ----------
+# ---------- column detection ----------
 
 def _detect_col(cols: List[str], candidates: List[str]) -> Optional[str]:
     lower = {c.lower(): c for c in cols}
@@ -155,34 +156,32 @@ def _pick_dst_value_col(engine: Engine) -> str:
     return "yhat"
 
 
-# ---------- row builders (fixed placeholder names) ----------
+# ---------- row builders (dict4固定: run_id, unique_id, ds, val) ----------
 
-def _rows_pg(run_id: str, df: pd.DataFrame) -> Iterable[Dict[str, object]]:
+def _rows_for(engine: Engine, run_id: str, df: pd.DataFrame) -> Iterable[Dict[str, object]]:
     uid_col = _pick_uid_col(df)
     ts = _pick_ts_series(df)
     val_col = _pick_value_col(df)
 
     uid = df[uid_col].astype(str)
-    ts_utc = _to_utc_aware(ts)
+    ts_utc = _to_utc(ts)
     val = pd.to_numeric(df[val_col], errors="coerce")
 
-    mask = (~uid.isna()) & (~ts_utc.isna()) & (~val.isna())
-    for u, d, y in zip(uid[mask], ts_utc[mask].dt.to_pydatetime(), val[mask]):
-        yield {"run_id": run_id, "unique_id": u, "ds": d, "val": float(y)}
+    dialect = engine.url.get_backend_name()
+    if dialect == "postgresql":
+        ds_series = ts_utc.dt.to_pydatetime()
+    else:
+        ds_series = _to_sqlite_utc_text(ts_utc)
 
-def _rows_sqlite(run_id: str, df: pd.DataFrame) -> Iterable[Tuple[object, ...]]:
-    uid_col = _pick_uid_col(df)
-    ts = _pick_ts_series(df)
-    val_col = _pick_value_col(df)
-
-    uid = df[uid_col].astype(str)
-    ts_utc = _to_utc_aware(ts)
-    ts_txt = _to_sqlite_utc_text(ts_utc)
-    val = pd.to_numeric(df[val_col], errors="coerce")
-
-    mask = (~uid.isna()) & (~ts_txt.isna()) & (~val.isna())
-    for u, d, y in zip(uid[mask], ts_txt[mask], val[mask]):
-        yield (run_id, u, str(d), float(y))
+    mask = (~uid.isna()) & (~pd.Series(ds_series).isna()) & (~val.isna())
+    # index を揃えて安全にイテレート
+    for i in df.index[mask]:
+        yield {
+            "run_id": run_id,
+            "unique_id": str(uid.loc[i]),
+            "ds": ds_series[i],   # pg: datetime(tz=UTC)、sqlite: 'YYYY-MM-DD HH:MM:SS'
+            "val": float(val.loc[i]),
+        }
 
 
 # ---------- main persist ----------
@@ -294,26 +293,16 @@ def persist(
                 return
 
             dst_val_col = _pick_dst_value_col(eng)
-
-            if dialect == "postgresql":
-                rows = list(_rows_pg(run_id, df))
-                if rows:
-                    # named binds with a fixed ':val' key (robust)
-                    conn.execute(
-                        text(f"""
-                            INSERT INTO predictions (run_id, unique_id, ds, {dst_val_col})
-                            VALUES (:run_id, :unique_id, :ds, :val)
-                        """),
-                        rows,
-                    )
-            else:
-                rows = list(_rows_sqlite(run_id, df))
-                if rows:
-                    # use positional qmarks to avoid named-binding edge cases on SQLite
-                    conn.exec_driver_sql(
-                        f"INSERT INTO predictions (run_id, unique_id, ds, {dst_val_col}) VALUES (?,?,?,?)",
-                        rows,
-                    )
+            rows = list(_rows_for(eng, run_id, df))
+            if rows:
+                # 名前付きバインド + 行辞書（4キー固定）
+                conn.execute(
+                    text(f"""
+                        INSERT INTO predictions (run_id, unique_id, ds, {dst_val_col})
+                        VALUES (:run_id, :unique_id, :ds, :val)
+                    """),
+                    rows,
+                )
 
     # Useful in pipelines/tests
     print(run_id)
