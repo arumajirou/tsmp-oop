@@ -198,15 +198,21 @@ def _rows_pg_dict(run_id: str, df: pd.DataFrame) -> Iterable[Dict[str, object]]:
     val_col = _pick_value_col(df)
 
     uid = df[uid_col].astype(str)
-    ts_utc = _to_utc(ts)
+    ts_utc = _to_utc(ts)  # tz-aware UTC pandas Series
     val = pd.to_numeric(df[val_col], errors="coerce")
 
     mask = (~uid.isna()) & (~ts_utc.isna()) & (~val.isna())
     idx = df.index[mask]
-    ds_py = ts_utc.loc[idx].dt.to_pydatetime()
 
+    # ndarray を作らず、各行で pydatetime 化（tz-aware のまま）
     for i in idx:
-        yield {"run_id": run_id, "unique_id": str(uid.loc[i]), "ds": ds_py.loc[i], "val": float(val.loc[i])}
+        ds_py = ts_utc.loc[i].to_pydatetime()  # ← ここが安全
+        yield {
+            "run_id": run_id,
+            "unique_id": str(uid.loc[i]),
+            "ds": ds_py,                  # tz-aware UTC datetime
+            "val": float(val.loc[i]),
+        }
 
 def _rows_sqlite_tuple4(run_id: str, df: pd.DataFrame) -> Iterable[Tuple[object, ...]]:
     uid_col = _pick_uid_col(df)
