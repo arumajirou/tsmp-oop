@@ -233,8 +233,8 @@ def build_features_pandas(df: pd.DataFrame, max_lag: int) -> pd.DataFrame:
     })
     # first/last date ordinal (constant)
     grng = df_sorted.groupby("unique_id", sort=False)["ds"].agg(["min","max"]).reset_index()
-    grng["stat_start_ord"] = ((grng["min"].dt.floor("D") - pd.Timestamp("1970-01-01")).dt.days.astype("int32"))
-    grng["stat_end_ord"]   = ((grng["max"].dt.floor("D") - pd.Timestamp("1970-01-01")).dt.days.astype("int32"))
+    grng["stat_start_ord"] = grng["min"].astype("int64")
+    grng["stat_end_ord"]   = grng["max"].astype("int64")
     grng = grng[["unique_id","stat_start_ord","stat_end_ord"]]
 
     stat = df_sorted[["unique_id"]].copy()
