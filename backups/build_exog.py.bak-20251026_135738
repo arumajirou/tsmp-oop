@@ -258,7 +258,9 @@ def build_features_pandas(df: pd.DataFrame, max_lag: int) -> pd.DataFrame:
         "unique_id": df_sorted["unique_id"].values,
         "ds":        df_sorted["ds"].dt.date.values
     })
+stat_only = stat.drop(columns=["unique_id"], errors="ignore").reset_index(drop=True)
     df_out = pd.concat([df_out, futr.loc[df_sorted.index].reset_index(drop=True),
+df_out = df_out.loc[:, ~df_out.columns.duplicated()]
                         hist.reset_index(drop=True),
                         stat.reset_index(drop=True)], axis=1)
 
@@ -395,8 +397,8 @@ def main():
     stat_cols = [c for c in feat.columns if c.startswith("stat_")]
     cols = base + futr_cols + hist_cols + stat_cols
     feat = feat[cols]
-    feat = feat.loc[:, ~feat.columns.duplicated()]
-    feat = feat.replace([np.inf, -np.inf], 0).fillna(0)
+feat = feat.loc[:, ~feat.columns.duplicated()]
+feat = feat.replace([np.inf, -np.inf], 0).fillna(0)
 
     # recreate target to exact schema
     dtypes_map = {c: ("int32" if str(feat[c].dtype).startswith("int") else
