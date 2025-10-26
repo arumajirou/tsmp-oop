@@ -5,14 +5,12 @@ Persist pipeline results to DB.
 
 Rules:
 - Never generate a new run_id. Always use --run-json (outputs/last_run.json).
-- Upsert 'runs' row (PostgreSQL/SQLite 方言対応)。
-- --pred-file が指定されたら predictions を「run_id 単位で全削除 → 一括 INSERT」。
-- ds は UTC で保存：
+- Upsert 'runs' row (PostgreSQL/SQLite dialect-aware).
+- If --pred-file is given: DELETE all predictions for the run_id, then bulk INSERT.
+- Timestamps are stored in UTC:
     - PostgreSQL: tz-aware (timestamptz)
-    - SQLite    : 'YYYY-MM-DD HH:MM:SS' の UTC 文字列
-- config の形は {"config": {...}} に正規化（$.config.horizon を想定）。
-- 予測の値列は yhat|yhat_mean|pred|forecast|y_pred|prediction|value|point|mean を優先順で自動検出。
-  見つからない場合は、数値列からヒューリスティックに 1 本を選択（y,y_true,actual 等は除外）。
+    - SQLite    : 'YYYY-MM-DD HH:MM:SS' UTC string
+- Config is normalized to {"config": {...}} (expects $.config.horizon).
 """
 
 from __future__ import annotations
@@ -21,7 +19,7 @@ import argparse
 import json
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Iterable, Optional, List, Dict
+from typing import Iterable, Optional, List, Dict, Tuple
 
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -33,7 +31,7 @@ except Exception:
     yaml = None
 
 
-# ---------- 時刻ユーティリティ ----------
+# ---------- time utils ----------
 
 def _utc_now_pg():
     return datetime.now(timezone.utc)
@@ -42,16 +40,14 @@ def _utc_now_sqlite_str():
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 def _to_utc_aware(series: pd.Series) -> pd.Series:
-    """任意の日時列を tz-aware UTC に正規化（pandas Series -> datetime64[ns, UTC]）"""
     s = pd.to_datetime(series, utc=True, errors="coerce")
     return s.dt.tz_convert("UTC")
 
 def _to_sqlite_utc_text(series_utc: pd.Series) -> pd.Series:
-    """UTC aware -> 'YYYY-MM-DD HH:MM:SS'（tz-naive文字列）"""
     return series_utc.dt.tz_localize(None).dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
-# ---------- 入力ロード／正規化 ----------
+# ---------- load / normalize ----------
 
 def _load_last_run_json(p: Path) -> dict:
     d = json.loads(p.read_text(encoding="utf-8"))
@@ -85,14 +81,13 @@ def _read_predictions_frame(path: Path) -> pd.DataFrame:
         return pd.read_parquet(path)
     if ext == ".csv":
         return pd.read_csv(path)
-    # フォーマット自動判定（まず Parquet、次に CSV）
     try:
         return pd.read_parquet(path)
     except Exception:
         return pd.read_csv(path)
 
 
-# ---------- カラム自動検出（robust） ----------
+# ---------- column detection (robust) ----------
 
 def _detect_col(cols: List[str], candidates: List[str]) -> Optional[str]:
     lower = {c.lower(): c for c in cols}
@@ -123,13 +118,13 @@ def _pick_ts_series(df: pd.DataFrame) -> pd.Series:
     raise ValueError("predictions file must contain a datetime-like column (ds|timestamp|time|date)")
 
 def _pick_value_col(df: pd.DataFrame) -> str:
-    # 優先候補で探索
     val = _detect_col(df.columns.tolist(), _VAL_CANDIDATES)
     if val:
         return val
-    # 数値列ヒューリスティック（よくある GT 列は除外）
-    exclude = { "y", "y_true", "actual", "y_lo", "y_hi", "y_lower", "y_upper",
-                "lower", "upper", "lo", "hi" }
+    exclude = {
+        "y", "y_true", "actual", "y_lo", "y_hi",
+        "y_lower", "y_upper", "lower", "upper", "lo", "hi"
+    }
     numeric = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     numeric = [c for c in numeric if c.lower() not in exclude]
     if numeric:
@@ -138,14 +133,9 @@ def _pick_value_col(df: pd.DataFrame) -> str:
                      "tried: " + ", ".join(_VAL_CANDIDATES))
 
 
-# ---------- 予測値の挿入先カラムをテーブル実在列にマップ ----------
+# ---------- choose destination value column existing in table ----------
 
 def _pick_dst_value_col(engine: Engine) -> str:
-    """
-    predictions テーブルに存在する値カラムを選択。
-    典型: yhat / yhat_mean / pred / forecast のいずれか。
-    無ければ yhat を使用（スキーマに依存）。
-    """
     dialect = engine.url.get_backend_name()
     with engine.begin() as conn:
         if dialect == "sqlite":
@@ -165,11 +155,11 @@ def _pick_dst_value_col(engine: Engine) -> str:
     return "yhat"
 
 
-# ---------- rows 準備（PG/SQLite） ----------
+# ---------- row builders (fixed placeholder names) ----------
 
-def _prepare_rows_pg(run_id: str, df: pd.DataFrame, dst_val_col: str) -> Iterable[dict]:
+def _rows_pg(run_id: str, df: pd.DataFrame) -> Iterable[Dict[str, object]]:
     uid_col = _pick_uid_col(df)
-    ts = _pick_ts_series(df)              # tz-aware UTC
+    ts = _pick_ts_series(df)
     val_col = _pick_value_col(df)
 
     uid = df[uid_col].astype(str)
@@ -177,34 +167,25 @@ def _prepare_rows_pg(run_id: str, df: pd.DataFrame, dst_val_col: str) -> Iterabl
     val = pd.to_numeric(df[val_col], errors="coerce")
 
     mask = (~uid.isna()) & (~ts_utc.isna()) & (~val.isna())
-    uid = uid[mask]
-    ts_utc = ts_utc[mask]
-    val = val[mask]
+    for u, d, y in zip(uid[mask], ts_utc[mask].dt.to_pydatetime(), val[mask]):
+        yield {"run_id": run_id, "unique_id": u, "ds": d, "val": float(y)}
 
-    # Python tz-aware datetime で渡す
-    for u, d, y in zip(uid, ts_utc.dt.to_pydatetime(), val):
-        yield {"run_id": run_id, "unique_id": u, "ds": d, dst_val_col: float(y)}
-
-def _prepare_rows_sqlite(run_id: str, df: pd.DataFrame, dst_val_col: str) -> Iterable[dict]:
+def _rows_sqlite(run_id: str, df: pd.DataFrame) -> Iterable[Tuple[object, ...]]:
     uid_col = _pick_uid_col(df)
-    ts = _pick_ts_series(df)              # tz-aware UTC
+    ts = _pick_ts_series(df)
     val_col = _pick_value_col(df)
 
     uid = df[uid_col].astype(str)
     ts_utc = _to_utc_aware(ts)
-    ts_txt = _to_sqlite_utc_text(ts_utc)  # 'YYYY-MM-DD HH:MM:SS'
+    ts_txt = _to_sqlite_utc_text(ts_utc)
     val = pd.to_numeric(df[val_col], errors="coerce")
 
     mask = (~uid.isna()) & (~ts_txt.isna()) & (~val.isna())
-    uid = uid[mask]
-    ts_txt = ts_txt[mask]
-    val = val[mask]
-
-    for u, d, y in zip(uid, ts_txt, val):
-        yield {"run_id": run_id, "unique_id": u, "ds": str(d), dst_val_col: float(y)}
+    for u, d, y in zip(uid[mask], ts_txt[mask], val[mask]):
+        yield (run_id, u, str(d), float(y))
 
 
-# ---------- メイン永続化 ----------
+# ---------- main persist ----------
 
 def persist(
     dsn: str,
@@ -232,7 +213,7 @@ def persist(
     eng = create_engine(dsn, pool_pre_ping=True)
     dialect = eng.url.get_backend_name()
 
-    # ---------- runs UPSERT ----------
+    # ----- runs upsert -----
     if dialect == "postgresql":
         created_at = updated_at = _utc_now_pg()
         sql_runs = text(
@@ -299,41 +280,38 @@ def persist(
     with eng.begin() as conn:
         conn.execute(sql_runs, runs_params)
 
-        # ---------- predictions ingest (optional) ----------
+        # ----- predictions ingest (optional) -----
         if pred_file:
             if not pred_file.exists():
                 raise FileNotFoundError(str(pred_file))
 
             df = _read_predictions_frame(pred_file)
+            # Always clear existing rows for this run_id
+            conn.execute(text("DELETE FROM predictions WHERE run_id = :rid"), {"rid": run_id})
+
             if df is None or df.empty:
-                # 空なら何もしない（既存は全削除済みにしておくのが安全）
-                conn.execute(text("DELETE FROM predictions WHERE run_id = :rid"), {"rid": run_id})
                 print(run_id)
                 return
-
-            # run_id 指定のため、既存行をクリア
-            conn.execute(text("DELETE FROM predictions WHERE run_id = :rid"), {"rid": run_id})
 
             dst_val_col = _pick_dst_value_col(eng)
 
             if dialect == "postgresql":
-                rows = list(_prepare_rows_pg(run_id, df, dst_val_col))
+                rows = list(_rows_pg(run_id, df))
                 if rows:
+                    # named binds with a fixed ':val' key (robust)
                     conn.execute(
                         text(f"""
                             INSERT INTO predictions (run_id, unique_id, ds, {dst_val_col})
-                            VALUES (:run_id, :unique_id, :ds, :{dst_val_col})
+                            VALUES (:run_id, :unique_id, :ds, :val)
                         """),
                         rows,
                     )
             else:
-                rows = list(_prepare_rows_sqlite(run_id, df, dst_val_col))
+                rows = list(_rows_sqlite(run_id, df))
                 if rows:
-                    conn.execute(
-                        text(f"""
-                            INSERT INTO predictions (run_id, unique_id, ds, {dst_val_col})
-                            VALUES (:run_id, :unique_id, :ds, :{dst_val_col})
-                        """),
+                    # use positional qmarks to avoid named-binding edge cases on SQLite
+                    conn.exec_driver_sql(
+                        f"INSERT INTO predictions (run_id, unique_id, ds, {dst_val_col}) VALUES (?,?,?,?)",
                         rows,
                     )
 
