@@ -1,0 +1,35 @@
+groups:
+  - name: tsmp-recording
+    rules:
+      - record: job:http_5xx_rate_5m
+        expr: sum(rate(http_requests_total{status=~"5.."}[5m])) by (job)
+      - record: job:http_all_rate_5m
+        expr: sum(rate(http_requests_total[5m])) by (job)
+      - record: job:http_5xx_ratio_5m
+        expr: job:http_5xx_rate_5m / ignoring(job) job:http_all_rate_5m
+      - record: job:req_latency_p95_5m
+        expr: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, job))
+
+  - name: tsmp-alerts
+    rules:
+      - alert: TSMP_API_Health_Bad
+        expr: tsmp_health_ok == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "TSMP API health failing"
+          description: "/health の SLO チェックが連続で失敗"
+      - alert: TSMP_API_High_5xx
+        expr: job:http_5xx_ratio_5m > 0.02
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "5xx error ratio > 2% (5m)"
+          description: "5xx 比率が 2% を超過"
+      - alert: TSMP_Data_Predictions_Missing
+        expr: tsmp_predictions_count == 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Predictions missing for the latest run"
+          description: "最新 run の予測件数が 0 件"

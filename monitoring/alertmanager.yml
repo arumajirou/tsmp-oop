@@ -1,0 +1,16 @@
+route:
+  receiver: slack
+  group_by: ['alertname']
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 1h
+
+receivers:
+  - name: slack
+    slack_configs:
+      - api_url: ${SLACK_WEBHOOK_URL}
+        send_resolved: true
+        text: >-
+          *{{ .Status | toUpper }}* {{ .CommonLabels.alertname }}
+          {{- if .CommonAnnotations.summary }} — {{ .CommonAnnotations.summary }}{{ end }}
+          {{- if .CommonAnnotations.description }}\n{{ .CommonAnnotations.description }}{{ end }}
